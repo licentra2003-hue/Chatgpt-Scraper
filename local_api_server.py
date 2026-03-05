@@ -3,6 +3,8 @@
 import asyncio
 import json
 import os
+from dotenv import load_dotenv
+load_dotenv()
 import uuid
 from datetime import datetime
 from typing import Dict, Any
@@ -129,7 +131,7 @@ async def list_jobs():
 
 if __name__ == "__main__":
     print("🌐 Starting Local Scraper API Server...")
-    print("📝 API will be available at: http://localhost:3000")
-    print("🔗 Try: curl -X POST http://localhost:3000/api/scrape -H 'Content-Type: application/json' -d '{\"query\":\"What is the best MMP platform?\"}'")
+    print("📝 API will be available at: http://localhost:3005")
+    print("🔗 Try: curl -X POST http://localhost:3005/api/scrape -H 'Content-Type: application/json' -d '{\"query\":\"What is the best MMP platform?\"}'")
     
-    uvicorn.run(app, host="0.0.0.0", port=3000)
+    uvicorn.run(app, host="0.0.0.0", port=3005)

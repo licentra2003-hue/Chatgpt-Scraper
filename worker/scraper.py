@@ -3,6 +3,7 @@ import os
 import random
 import hashlib
 import shutil
+import re
 from datetime import datetime
 from dataclasses import dataclass
 from typing import List, Optional
@@ -354,31 +355,35 @@ class ChatGPTScraper:
         await asyncio.sleep(0.5)
 
     async def _submit_query(self, page: Page, query: str):
-        print("⌨️ Inputting query...")
-        textarea = page.locator(self.selectors.PROMPT_TEXTAREA)
-        
-        # Increased wait time for Headless/Cloudflare
+        print("⌨️ Inputting query with new locators...")
         try:
-            await textarea.wait_for(state="visible", timeout=20000)
-            await textarea.click(force=True)
-        except:
-            # Retry overlay kill if input is blocked
-            await self._kill_overlays(page)
-            if await textarea.count() > 0:
-                await textarea.click(force=True)
-            else:
-                raise Exception("Input textarea not found (Likely blocked by Cloudflare)")
-
-        await textarea.fill("") 
-        await textarea.type(query, delay=random.randint(15, 40))
-        await asyncio.sleep(0.5)
-        
-        send_btn = page.locator(self.selectors.SEND_BUTTON)
-        if await send_btn.is_visible():
-            await send_btn.click(force=True)
-        else:
+            # Step 1: Click the paragraph role matching empty string
+            paragraph = page.get_by_role("paragraph").filter(has_text=re.compile(r"^$"))
+            await paragraph.click(timeout=20000)
+            
+            # Step 2: Type in the prompt textarea like a human
+            textarea = page.locator("#prompt-textarea")
+            await textarea.fill("") # clear if anything is there
+            await textarea.type(query, delay=random.randint(30, 80))
+            await asyncio.sleep(0.5)
+            
+            # Step 3: Send
             await page.keyboard.press("Enter")
-        print("✓ Query Sent")
+            print("✓ Query Sent")
+        except Exception as e:
+            await self._kill_overlays(page)
+            print(f"Failed to submit query with new locator. Attempting again: {e}")
+            try:
+                paragraph = page.get_by_role("paragraph").filter(has_text=re.compile(r"^$"))
+                await paragraph.click(timeout=10000)
+                textarea = page.locator("#prompt-textarea")
+                await textarea.fill("")
+                await textarea.type(query, delay=random.randint(30, 80))
+                await asyncio.sleep(0.5)
+                await page.keyboard.press("Enter")
+                print("✓ Query Sent")
+            except Exception as e2:
+                raise Exception(f"Input not located. {e2}")
 
     async def _wait_for_response(self, page: Page):
         # Added check for Sign-up wall

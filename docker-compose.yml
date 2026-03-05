@@ -3,7 +3,7 @@ services:
     image: rabbitmq:3.12-management
     container_name: scraper-rabbitmq-new
     ports:
-      - "5673:5672"   # AMQP port
+      - "5673:5672" # AMQP port
       - "15673:15672" # Management console port
     environment:
       RABBITMQ_DEFAULT_USER: admin
@@ -12,7 +12,7 @@ services:
       - rabbitmq_data:/var/lib/rabbitmq
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      test: [ "CMD", "rabbitmq-diagnostics", "ping" ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -50,8 +50,8 @@ services:
       - api
     restart: unless-stopped
     deploy:
-      replicas: 1  # Reduce to 1 for testing
-    ipc: host  # Allow browser shared memory
+      replicas: 1 # Reduce to 1 for testing
+    ipc: host # Allow browser shared memory
     volumes:
       - worker_profiles:/app/profiles
 

@@ -3,7 +3,7 @@ import json
 
 # Test the API with a simple request
 response = requests.post(
-    "http://localhost:3000/api/scrape",
+    "http://localhost:3005/api/scrape",
     headers={"Content-Type": "application/json"},
     json={"query": "What is the distance to the moon?"}
 )
