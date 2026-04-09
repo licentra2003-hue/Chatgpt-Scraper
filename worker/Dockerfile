@@ -4,12 +4,18 @@ FROM mcr.microsoft.com/playwright/python:v1.48.0-jammy
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
+# Install system dependencies and Microsoft fonts for Windows spoofing
+RUN apt-get update && \
+    echo "ttf-mscorefonts-installer msttcorefonts/accepted-mscorefonts-eula select true" | debconf-set-selections && \
+    apt-get install -y --no-install-recommends \
     wget \
     gnupg \
     ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    fontconfig \
+    ttf-mscorefonts-installer \
+    fonts-ubuntu && \
+    fc-cache -f -v && \
+    rm -rf /var/lib/apt/lists/*
 
 # Copy requirements and install Python dependencies
 COPY requirements.txt .

@@ -8,7 +8,7 @@ from datetime import datetime
 from dataclasses import dataclass
 from typing import List, Optional
 from playwright.async_api import Page, async_playwright
-
+from playwright_stealth import Stealth
 # ==================== DATA MODELS ====================
 
 @dataclass
@@ -62,12 +62,8 @@ class BrowserManager:
         # Advanced stealth JS with realistic hardware fingerprints
         self.stealth_js = f"""
             // Platform and webdriver
-            Object.defineProperty(navigator, 'platform', {{ get: () => 'Win32' }});
+            Object.defineProperty(navigator, 'platform', {{ get: () => 'Linux x86_64' }});
             Object.defineProperty(navigator, 'webdriver', {{ get: () => undefined }});
-            
-            // Hardware specs (realistic high-end PC)
-            Object.defineProperty(navigator, 'hardwareConcurrency', {{ get: () => {self.stealth_config['cores']} }});
-            Object.defineProperty(navigator, 'deviceMemory', {{ get: () => {self.stealth_config['memory']} }});
             
             // WebGL fingerprint
             const getParameter = WebGLRenderingContext.prototype.getParameter;
@@ -76,6 +72,10 @@ class BrowserManager:
                 if (parameter === 37446) return '{self.stealth_config['gpu_renderer']}';
                 return getParameter(parameter);
             }};
+
+            // Hardware specs
+            Object.defineProperty(navigator, 'hardwareConcurrency', {{ get: () => 4 }});
+            Object.defineProperty(navigator, 'deviceMemory', {{ get: () => 8 }});
             
             // Chrome runtime (make it look like real Chrome)
             window.chrome = {{ 
@@ -142,34 +142,45 @@ class BrowserManager:
             # This forces Chrome to render full UI engine in background
             
             launch_args = [
-                "--disable-blink-features=AutomationControlled", 
-                "--no-sandbox", 
-                "--disable-infobars", 
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--window-size=1920,1080", 
-                "--ignore-certificate-errors",
-                "--disable-background-timer-throttling",
-                "--disable-backgrounding-occluded-windows",
-                "--disable-renderer-backgrounding",
+                '--disable-blink-features=AutomationControlled',
+                '--no-sandbox',
+                '--disable-setuid-sandbox', # CRITICAL FOR DOCKER
+                '--disable-dev-shm-usage',
+                '--disable-infobars', 
+                '--disable-notifications',
+                '--start-maximized',
+                '--window-size=1920,1080',
+                '--ignore-certificate-errors',
+                '--disable-gpu-internal' # Added for Docker headless stability
             ]
             
-            # Add the magic flag for headless mode
-            if headless:
-                launch_args.append("--headless=new")
-
             self.context = await self.playwright.chromium.launch_persistent_context(
                 user_data_dir=self.user_data_dir,
-                headless=False,  # CRITICAL: Keep False, we control via --headless=new
-                proxy=proxy,
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                viewport={"width": 1920, "height": 1080},
-                locale="en-US",
-                timezone_id="America/New_York",
+                headless=headless,
                 args=launch_args,
-                ignore_default_args=["--enable-automation"],
+                ignore_default_args=['--enable-automation'],
+                no_viewport=True, # PREVENT VIEWPORT MISMATCH Detection
+                extra_http_headers={
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'DNT': '1', 
+                    'Connection': 'keep-alive',
+                    'Upgrade-Insecure-Requests': '1',
+                    'Sec-Fetch-Dest': 'document',
+                    'Sec-Fetch-Mode': 'navigate',
+                    'Sec-Fetch-Site': 'none',
+                    'Cache-Control': 'max-age=0'
+                },
+                user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                proxy=proxy,
+                locale="en-IN",
+                timezone_id="Asia/Kolkata",
                 color_scheme="light",
             )
+            
+            # Apply Stealth evasions to the entire context
+            self.stealth = Stealth()
+            await self.stealth.apply_stealth_async(self.context)
 
     async def get_page(self) -> Page:
         if not self.context: 
@@ -357,15 +368,25 @@ class ChatGPTScraper:
     async def _submit_query(self, page: Page, query: str):
         print("⌨️ Inputting query with new locators...")
         try:
-            # Step 1: Click the paragraph role matching empty string
-            paragraph = page.get_by_role("paragraph").filter(has_text=re.compile(r"^$"))
-            await paragraph.click(timeout=20000)
+            textarea = page.locator("#prompt-textarea")
+            await textarea.wait_for(state="visible", timeout=20000)
+            
+            # Step 1: Click the textarea container to focus it
+            try:
+                paragraph = page.get_by_role("paragraph").filter(has_text=re.compile(r"^$"))
+                if await paragraph.count() > 0:
+                    await paragraph.first.click(timeout=2000)
+                else:
+                    await textarea.click(timeout=2000)
+            except:
+                await textarea.click(timeout=2000)
+            
+            await asyncio.sleep(random.uniform(0.2, 0.5))
             
             # Step 2: Type in the prompt textarea like a human
-            textarea = page.locator("#prompt-textarea")
             await textarea.fill("") # clear if anything is there
-            await textarea.type(query, delay=random.randint(30, 80))
-            await asyncio.sleep(0.5)
+            await textarea.type(query, delay=random.uniform(40, 100))
+            await asyncio.sleep(random.uniform(0.3, 0.8))
             
             # Step 3: Send
             await page.keyboard.press("Enter")
@@ -374,12 +395,12 @@ class ChatGPTScraper:
             await self._kill_overlays(page)
             print(f"Failed to submit query with new locator. Attempting again: {e}")
             try:
-                paragraph = page.get_by_role("paragraph").filter(has_text=re.compile(r"^$"))
-                await paragraph.click(timeout=10000)
                 textarea = page.locator("#prompt-textarea")
+                await textarea.click(timeout=10000)
+                await asyncio.sleep(random.uniform(0.2, 0.5))
                 await textarea.fill("")
-                await textarea.type(query, delay=random.randint(30, 80))
-                await asyncio.sleep(0.5)
+                await textarea.type(query, delay=random.uniform(40, 100))
+                await asyncio.sleep(random.uniform(0.3, 0.8))
                 await page.keyboard.press("Enter")
                 print("✓ Query Sent")
             except Exception as e2:
@@ -429,7 +450,9 @@ class ChatGPTScraper:
             if await markdown_div.count() == 0:
                 # Fallback to inner_text
                 print("   ⚠️ No markdown div found, using fallback")
+                await page.screenshot(path="/app/debug_docker_fallback.png")
                 text = await last_msg.inner_text()
+                print(f"   💬 Fallback text length: {len(text)}")
                 return text.strip()
             
             clean_text = await markdown_div.first.evaluate('''(element) => {
