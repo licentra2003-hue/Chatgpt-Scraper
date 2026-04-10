@@ -6,7 +6,7 @@ import shutil
 import re
 from datetime import datetime
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from playwright.async_api import Page, async_playwright
 from playwright_stealth import Stealth
 
@@ -66,7 +66,14 @@ class ChatGPTSelectors:
 # ==================== BROWSER MANAGER (NEW HEADLESS TRICK) ====================
 
 class BrowserManager:
-    def __init__(self, user_data_dir: str):
+    def __init__(self, user_data_dir: str, proxy_server=None, proxy_username=None, proxy_password=None):
+        self.proxy_server = proxy_server
+        self.proxy_username = proxy_username
+        self.proxy_password = proxy_password
+        
+        # Honest Linux Desktop Identity (Align with Playwright 1.48 -> Chrome 129)
+        self.linux_ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36'
+        
         self.context = None
         self.playwright = None
         self.user_data_dir = user_data_dir
@@ -81,11 +88,7 @@ class BrowserManager:
             webgl_renderer_override=self.stealth_config['gpu_renderer'],
             navigator_platform_override='Linux x86_64',
             navigator_languages_override=('en-US', 'en'),
-            navigator_user_agent_override=(
-                "Mozilla/5.0 (X11; Linux x86_64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
+            navigator_user_agent_override=self.linux_ua,
         )
 
         # Deep supplemental stealth JS — patches signals that playwright-stealth v2
@@ -100,8 +103,8 @@ class BrowserManager:
                 Object.defineProperty(navigator, 'languages', {{ get: () => ['en-US', 'en'] }});
                 Object.defineProperty(navigator, 'vendor',    {{ get: () => 'Google Inc.' }});
 
-                // Linux Chrome 131 UA
-                const ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+                // Linux Chrome 129 UA
+                const ua = "{self.linux_ua}";
                 Object.defineProperty(navigator, 'userAgent',  {{ get: () => ua }});
                 Object.defineProperty(navigator, 'appVersion', {{ get: () => ua.replace("Mozilla/", "") }});
             }} catch(e) {{}}
@@ -111,9 +114,9 @@ class BrowserManager:
             // platformVersion: '' is correct — Linux Chrome sends empty string.
             try {{
                 const brands = [
-                    {{ brand: 'Google Chrome', version: '131' }},
-                    {{ brand: 'Chromium', version: '131' }},
-                    {{ brand: 'Not_A Brand', version: '24' }}
+                    {{ brand: 'Google Chrome', version: '129' }},
+                    {{ brand: 'Not=A?Brand', version: '8' }},
+                    {{ brand: 'Chromium', version: '129' }}
                 ];
                 const userAgentData = {{
                     brands: brands,
@@ -127,7 +130,7 @@ class BrowserManager:
                         architecture: 'x86',
                         bitness: '64',
                         model: '',
-                        uaFullVersion: '131.0.6778.86',
+                        uaFullVersion: '129.0.0.0',
                         fullVersionList: brands.map(b => ({{ ...b, version: b.version + '.0.0.0' }}))
                     }})
                 }};
@@ -233,6 +236,21 @@ class BrowserManager:
         }})();
         """
 
+    def _should_block_request(self, request):
+        """Block common telemetry and tracking domains to reduce bot-detection surface."""
+        block_list = [
+            "sentry.io",
+            "statsig.com",
+            "amplitude.com",
+            "mixpanel.com",
+            "google-analytics.com",
+            "pstats.chatgpt.com",
+            "featuregates.org"
+        ]
+        url = request.url.lower()
+        if any(domain in url for domain in block_list):
+            return True
+        return False
 
     def _generate_stealth_config(self, seed_string: str) -> dict:
         """Generate a consistent, realistic hardware fingerprint seeded from the profile path."""
@@ -275,9 +293,11 @@ class BrowserManager:
         headless = os.environ.get("HEADLESS", "true").lower() == "true"
 
         proxy = None
-        if os.environ.get("PROXY_SERVER"):
+        if self.proxy_server:
+            if not self.proxy_server.startswith(("http://", "https://")):
+                self.proxy_server = f"http://{self.proxy_server}"
             proxy = {
-                "server":   os.environ.get("PROXY_SERVER"),
+                "server":   self.proxy_server,
                 "username": os.environ.get("PROXY_USERNAME"),
                 "password": os.environ.get("PROXY_PASSWORD"),
             }
@@ -335,13 +355,10 @@ class BrowserManager:
             ignore_default_args=['--enable-automation'],
             viewport={"width": 1920, "height": 1080},
             # ── Honest Linux Desktop User-Agent ───────────────────────────
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
+            user_agent=self.linux_ua,
             extra_http_headers={
                 'Accept':                    'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+
                 'Accept-Encoding':           'gzip, deflate, br',
                 'Accept-Language':           'en-US,en;q=0.9',
                 'DNT':                       '1',
@@ -352,8 +369,7 @@ class BrowserManager:
                 'Sec-Fetch-Site':            'none',
                 'Cache-Control':             'max-age=0',
                 # ── Client Hints: aligned with Linux UA above ─────────────
-                # 'Linux' platform matches X11 UA and the actual OS TCP/IP stack.
-                'Sec-CH-UA':                 '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+                'Sec-CH-UA':                 '"Google Chrome";v="129", "Not=A?Brand";v="8", "Chromium";v="129"',
                 'Sec-CH-UA-Mobile':          '?0',
                 'Sec-CH-UA-Platform':        '"Linux"',
             },
@@ -485,21 +501,31 @@ class ManagedChatGPTScraper:
             raise RuntimeError("Scraper not initialized. Use async context manager.")
         
         page = await self.browser_manager.get_page()
-        return await self.scraper.scrape(page, query)
+        return await self.scraper.scrape(page, query, self.browser_manager)
+
 
 # ==================== SCRAPER CLASS ====================
-
 class ChatGPTScraper:
     def __init__(self):
         self.selectors = ChatGPTSelectors()
 
-    async def scrape(self, page: Page, query: str) -> ScrapingResult:
+    async def scrape(self, page: Page, query: str, browser_manager: Any = None) -> ScrapingResult:
+
         timestamp = datetime.now().isoformat()
         
         try:
+            # Telemetry Block
+            if browser_manager:
+                await page.route("**/*", lambda route: route.abort() if browser_manager._should_block_request(route.request) else route.continue_())
+
+
             print(f"Navigating to {self.selectors.CHATGPT_URL}...")
-            # Increase timeout for Cloudflare delays
             await page.goto(self.selectors.CHATGPT_URL, wait_until="domcontentloaded", timeout=60000)
+            
+            # Settle period: Allow the "Honest Linux" system to be poked by scripts
+            # and respond naturally before we start acting.
+            print("⏳ Settling session...")
+            await asyncio.sleep(3.0) 
             
             # --- CLOUDFLARE CHECK ---
             try:
@@ -604,24 +630,17 @@ class ChatGPTScraper:
         print("⌨️ Inputting query with new locators...")
         try:
             textarea = page.locator("#prompt-textarea")
-            await textarea.wait_for(state="visible", timeout=20000)
+            await textarea.wait_for(state="visible", timeout=15000)
             
-            # Step 1: Click the textarea container to focus it
-            try:
-                paragraph = page.get_by_role("paragraph").filter(has_text=re.compile(r"^$"))
-                if await paragraph.count() > 0:
-                    await paragraph.first.click(timeout=2000)
-                else:
-                    await textarea.click(timeout=2000)
-            except:
-                await textarea.click(timeout=2000)
-            
+            # Initial random mouse move
+            await page.mouse.move(random.randint(100, 500), random.randint(100, 500), steps=5)
+            await asyncio.sleep(random.uniform(0.3, 0.8))
+
+            await textarea.click(timeout=5000)
             await asyncio.sleep(random.uniform(0.2, 0.5))
             
             # Step 2: Type with human-like burst cadence.
-            # Real humans type in bursts: fast on common words, slow on transitions.
-            # A static delay range is a bot signal; we simulate micro-pauses.
-            await textarea.fill("")  # clear if anything is there
+            await textarea.fill("")
             words = query.split(' ')
             for i, word in enumerate(words):
                 chunk = word if i == len(words) - 1 else word + ' '
