@@ -1,0 +1,60 @@
+services:
+  rabbitmq:
+    image: rabbitmq:3.12-management
+    container_name: scraper-rabbitmq-new
+    ports:
+      - "5673:5672" # AMQP port
+      - "15673:15672" # Management console port
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: admin123
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "rabbitmq-diagnostics", "ping" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: scraper-api-new
+    ports:
+      - "3001:3000"
+    env_file:
+      - .env
+    environment:
+      RABBITMQ_URL: amqp://admin:admin123@rabbitmq:5672
+    depends_on:
+      - rabbitmq
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      RABBITMQ_URL: amqp://admin:admin123@rabbitmq:5672
+      HEADLESS: "true"
+      PROXY_SERVER: "in-pr.oxylabs.io:20000"
+      PROXY_USERNAME: "godseye_hY287"
+      PROXY_PASSWORD: "Godseye+584101"
+      API_URL: http://api:3000
+    depends_on:
+      - rabbitmq
+      - api
+    restart: unless-stopped
+    deploy:
+      replicas: 1 # Reduce to 1 for testing
+    ipc: host # Allow browser shared memory
+    volumes:
+      - worker_profiles:/app/profiles
+
+volumes:
+  rabbitmq_data:
+  worker_profiles:
