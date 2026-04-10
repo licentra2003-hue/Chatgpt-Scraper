@@ -9,7 +9,7 @@ from dataclasses import asdict
 from datetime import datetime, timedelta
 from supabase import create_client, Client
 from dotenv import load_dotenv
-from scraper import BrowserManager, ChatGPTScraper, ProfilePool
+from scraper import BrowserManager, ChatGPTScraper
 
 load_dotenv()
 
@@ -29,26 +29,17 @@ else:
 # Generate a unique identity for this worker container
 WORKER_ID = f"worker_{str(uuid.uuid4())[:8]}"
 
-# Initialize global profile pool
-profile_pool = ProfilePool(pool_size=3)
-
 async def process_job(ch, method, properties, body):
     profile_path = None
     browser_manager = None
-    slot_index = None
     try:
         data = json.loads(body)
         job_id = data.get("job_id")
         query = data.get("query")
 
-        # Checkout from pool or fallback
-        try:
-            slot_index, profile_path = await profile_pool.get_profile()
-            print(f"[{WORKER_ID}] Checked out pooled profile slot {slot_index}")
-        except Exception:
-            profile_path = os.path.join(os.getcwd(), "profiles", str(job_id))
-            print(f"[{WORKER_ID}] Falling back to per-job profile {job_id}")
-            
+        # Use a per-job persistent profile directory to isolate jobs.
+        # This will be deleted at the end of the job (success or failure).
+        profile_path = os.path.join(os.getcwd(), "profiles", str(job_id))
         browser_manager = BrowserManager(user_data_dir=profile_path)
 
         print(f"[{WORKER_ID}] Processing Job: {job_id}")
@@ -104,7 +95,7 @@ async def process_job(ch, method, properties, body):
             print(f"[{WORKER_ID}] Job {job_id} Failed: {e}")
 
             # === SMART CONTEXT ROTATION ===
-            if "soft block" in error_msg or "cloudflare" in error_msg or "sign up" in error_msg or "shadow block" in error_msg:
+            if "soft block" in error_msg or "cloudflare" in error_msg or "sign up" in error_msg:
                 print(f"[{WORKER_ID}] 🚨 BLOCK DETECTED! Rotating Identity...")
 
                 # 1. Close Browser
@@ -112,9 +103,7 @@ async def process_job(ch, method, properties, body):
                     await browser_manager.close()
 
                 # 2. Nuke Profile Folder (Reset Trust)
-                if slot_index is not None:
-                    profile_pool.mark_poisoned(slot_index)
-                elif profile_path and os.path.exists(profile_path):
+                if profile_path and os.path.exists(profile_path):
                     shutil.rmtree(profile_path)
                     print(f"[{WORKER_ID}] 🗑️ Profile deleted.")
 
@@ -127,22 +116,18 @@ async def process_job(ch, method, properties, body):
     except Exception as e:
         print(f"CRITICAL WORKER ERROR: {e}")
     finally:
-        # Always close the browser
+        # Always close and delete the per-job profile folder so context is not reused.
         try:
             if browser_manager is not None:
                 await browser_manager.close()
         except Exception as e:
             print(f"[{WORKER_ID}] Warning: failed to close browser for job {locals().get('job_id')}: {e}")
 
-        # Checkin pooled profile or delete fallback profile
         try:
-            if slot_index is not None:
-                profile_pool.return_profile(slot_index)
-                print(f"[{WORKER_ID}] Returned pooled profile slot {slot_index}")
-            elif profile_path and os.path.exists(profile_path):
+            if profile_path and os.path.exists(profile_path):
                 shutil.rmtree(profile_path)
         except Exception as e:
-            print(f"[{WORKER_ID}] Warning: failed to manage profile dir {profile_path}: {e}")
+            print(f"[{WORKER_ID}] Warning: failed to delete profile dir {profile_path}: {e}")
 
         ch.basic_ack(delivery_tag=method.delivery_tag)
 

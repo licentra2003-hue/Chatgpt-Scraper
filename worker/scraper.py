@@ -8,7 +8,7 @@ from datetime import datetime
 from dataclasses import dataclass
 from typing import List, Optional
 from playwright.async_api import Page, async_playwright
-from playwright_stealth import Stealth
+
 # ==================== DATA MODELS ====================
 
 @dataclass
@@ -59,62 +59,11 @@ class BrowserManager:
         self.user_data_dir = user_data_dir 
         self.stealth_config = self._generate_stealth_config(user_data_dir)
         
-        profile_seed = sum(ord(c) for c in user_data_dir) % 100
-
-        
         # Advanced stealth JS with realistic hardware fingerprints
         self.stealth_js = f"""
             // Platform and webdriver
-            Object.defineProperty(navigator, 'platform', {{ get: () => 'Linux x86_64' }});
+            Object.defineProperty(navigator, 'platform', {{ get: () => 'Win32' }});
             Object.defineProperty(navigator, 'webdriver', {{ get: () => undefined }});
-            
-            // FIX: outerHeight/outerWidth — screen param sets values before first JS fingerprint check runs
-            window.outerWidth = window.screen.width;
-            window.outerHeight = window.screen.height;
-            Object.defineProperty(navigator, 'connection', {{ get: () => ({{ effectiveType: '4g', rtt: 50, downlink: 10 }}) }});
-            
-            // FIX: Canvas 2D fingerprint — adds per-profile pixel noise to break shared headless hash
-            const profileSeed = {profile_seed};
-            
-            const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
-            HTMLCanvasElement.prototype.toDataURL = function() {{
-                const context = this.getContext('2d');
-                if (context) {{
-                    const shift = profileSeed % 10;
-                    context.fillStyle = `rgba(255, 255, 255, ${{0.001 * profileSeed}})`;
-                    context.fillRect(0, 0, 1, 1);
-                }}
-                return originalToDataURL.apply(this, arguments);
-            }};
-
-            const originalGetImageData = CanvasRenderingContext2D.prototype.getImageData;
-            CanvasRenderingContext2D.prototype.getImageData = function() {{
-                const imageData = originalGetImageData.apply(this, arguments);
-                if (imageData && imageData.data && imageData.data.length > 0) {{
-                    const noise = (profileSeed % 3) || 1;
-                    for (let i = 0; i < Math.min(12, imageData.data.length); i += 4) {{
-                        imageData.data[i] = Math.min(255, Math.max(0, imageData.data[i] + noise));
-                    }}
-                }}
-                return imageData;
-            }};
-            
-            // FIX: AudioContext fingerprint — adds per-profile float noise to rendered audio buffer
-            if (window.OfflineAudioContext) {{
-                const originalStartRendering = OfflineAudioContext.prototype.startRendering;
-                OfflineAudioContext.prototype.startRendering = function() {{
-                    return originalStartRendering.apply(this, arguments).then(buffer => {{
-                        if (buffer && buffer.length > 0) {{
-                            const channelData = buffer.getChannelData(0);
-                            for (let i = 0; i < Math.min(10, channelData.length); i++) {{
-                                channelData[i] += profileSeed * 0.0000001;
-                            }}
-                        }}
-                        return buffer;
-                    }});
-                }};
-            }}
-
             
             // WebGL fingerprint
             const getParameter = WebGLRenderingContext.prototype.getParameter;
@@ -125,17 +74,12 @@ class BrowserManager:
             }};
 
             // Hardware specs
-            Object.defineProperty(navigator, 'hardwareConcurrency', {{ get: () => {self.stealth_config['cores']} }});
-            Object.defineProperty(navigator, 'deviceMemory', {{ get: () => {self.stealth_config['memory']} }});
+            Object.defineProperty(navigator, 'hardwareConcurrency', {{ get: () => 4 }});
+            Object.defineProperty(navigator, 'deviceMemory', {{ get: () => 8 }});
             
             // Chrome runtime (make it look like real Chrome)
             window.chrome = {{ 
-                runtime: {{
-                    id: 'internal_chrome_id_mock',
-                    connect: () => {{}},
-                    sendMessage: () => {{}},
-                    onMessage: {{ addListener: () => {{}}, removeListener: () => {{}} }}
-                }}, 
+                runtime: {{}}, 
                 app: {{}}, 
                 csi: function(){{}}, 
                 loadTimes: function(){{}} 
@@ -170,50 +114,15 @@ class BrowserManager:
         ]
         vendor, renderer = random.choice(gpus)
         
-        # Read actual container core count
-        real_cores = os.cpu_count()
-        if not real_cores:
-            real_cores = 4
-            
         return {
-            "cores": real_cores,
+            "cores": random.choice([8, 12, 16]),
             "memory": random.choice([16, 32]),
             "gpu_vendor": vendor,
             "gpu_renderer": renderer
         }
 
-    def _get_real_chromium_version(self) -> tuple:
-        # FIX: Sec-CH-UA mismatch — reads real Chromium binary version so UA string matches client hints header
-        import subprocess, re, glob
-        real_version = "119"
-        try:
-            result = subprocess.run("chromium --version", shell=True, capture_output=True, text=True)
-            if "Chromium" not in result.stdout:
-                result = subprocess.run("chromium-browser --version", shell=True, capture_output=True, text=True)
-            
-            output = result.stdout.strip()
-            match = re.search(r' (\d+)\.', output)
-            if match:
-                real_version = match.group(1)
-            else:
-                paths = glob.glob("/home/pwuser/.cache/ms-playwright/chromium-*/chrome-linux/chrome")
-                if not paths:
-                    paths = glob.glob("/root/.cache/ms-playwright/chromium-*/chrome-linux/chrome")
-                if paths:
-                    result = subprocess.run(f"{paths[0]} --version", shell=True, capture_output=True, text=True)
-                    match = re.search(r' (\d+)\.', result.stdout)
-                    if match:
-                        real_version = match.group(1)
-        except Exception:
-            pass
-            
-        real_ua = f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{real_version}.0.0.0 Safari/537.36"
-        return real_version, real_ua
-
     async def start(self):
         if self.context is None:
-            real_version, real_ua = self._get_real_chromium_version()
-            
             self.playwright = await async_playwright().start()
             
             headless = os.environ.get("HEADLESS", "true").lower() == "true"
@@ -241,19 +150,19 @@ class BrowserManager:
                 '--disable-notifications',
                 '--start-maximized',
                 '--window-size=1920,1080',
-                '--ignore-certificate-errors',
-                '--disable-gpu', # Replaced disabled-gpu-internal with disable-gpu
-                '--force-device-scale-factor=1',
-                '--hide-scrollbars'
+                '--ignore-certificate-errors'
             ]
             
+            # Add the magic flag for headless mode
+            if headless:
+                launch_args.append("--headless=new")
+
             self.context = await self.playwright.chromium.launch_persistent_context(
                 user_data_dir=self.user_data_dir,
-                headless=headless,
+                headless=False, # We keep this False and pass --headless=new in args
                 args=launch_args,
                 ignore_default_args=['--enable-automation'],
                 no_viewport=True, # PREVENT VIEWPORT MISMATCH Detection
-                screen={"width": 1920, "height": 1080},
                 extra_http_headers={
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
                     'Accept-Encoding': 'gzip, deflate, br',
@@ -263,20 +172,14 @@ class BrowserManager:
                     'Sec-Fetch-Dest': 'document',
                     'Sec-Fetch-Mode': 'navigate',
                     'Sec-Fetch-Site': 'none',
-                    'Cache-Control': 'max-age=0',
-                    'Sec-CH-UA': f'"Chromium";v="{real_version}", "Not_A Brand";v="8"',
-                    'Sec-CH-UA-Platform': '"Linux"'
+                    'Cache-Control': 'max-age=0'
                 },
-                user_agent=real_ua,
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
                 proxy=proxy,
-                locale="en-IN",
-                timezone_id="Asia/Kolkata",
+                locale="en-US",
+                timezone_id="America/New_York",
                 color_scheme="light",
             )
-            
-            # Apply Stealth evasions to the entire context
-            self.stealth = Stealth()
-            await self.stealth.apply_stealth_async(self.context)
 
     async def get_page(self) -> Page:
         if not self.context: 
@@ -309,45 +212,6 @@ class BrowserManager:
             print(f"⚠️ Could not clean up profile {self.user_data_dir}: {e}")
 
 # ==================== PROFILE MANAGER ====================
-
-class ProfilePool:
-    """Manages a pool of persistent profile directories that are never deleted unless poisoned."""
-    
-    def __init__(self, pool_size: int = 3, base_profiles_dir: str = "./profiles"):
-        self.pool_size = pool_size
-        self.base_profiles_dir = base_profiles_dir
-        os.makedirs(base_profiles_dir, exist_ok=True)
-        self.queue = asyncio.Queue()
-        self.slots = {}
-        
-        # Initialize the pool slots
-        for i in range(pool_size):
-            profile_path = os.path.join(self.base_profiles_dir, f"pool_{i}")
-            os.makedirs(profile_path, exist_ok=True)
-            self.slots[i] = profile_path
-            self.queue.put_nowait(i)
-            
-    async def get_profile(self):
-        """Checkout a profile slot index and path"""
-        slot_index = await self.queue.get()
-        return slot_index, self.slots[slot_index]
-        
-    def return_profile(self, slot_index: int):
-        """Checkin a profile slot"""
-        self.queue.put_nowait(slot_index)
-        
-    def mark_poisoned(self, slot_index: int):
-        """If profile is poisoned (blocked), nuke only this slot and recreate it."""
-        profile_path = self.slots[slot_index]
-        try:
-            if os.path.exists(profile_path):
-                shutil.rmtree(profile_path, ignore_errors=True)
-                print(f"🗑️ Poisoned profile deleted: pool_{slot_index}")
-        except Exception as e:
-            print(f"⚠️ Could not delete poisoned profile pool_{slot_index}: {e}")
-        os.makedirs(profile_path, exist_ok=True)
-
-
 
 class ProfileManager:
     """Manages temporary browser profiles for concurrent scraping"""
@@ -442,8 +306,6 @@ class ChatGPTScraper:
             except: 
                 pass
 
-            await self._warmup_trust(page)
-
             print("🛡️ Clearing overlays...")
             await self._kill_overlays(page)
             
@@ -468,10 +330,6 @@ class ChatGPTScraper:
             await self._wait_for_sources_button(page)
             
             response_text = await self._extract_text(page)
-            if len(response_text.strip()) == 0:
-                await page.screenshot(path="/app/debug_shadow_block.png")
-                raise Exception("Shadow Block: Empty response returned silently")
-                
             source_links = await self._extract_sources(page)
             
             return ScrapingResult(
@@ -490,31 +348,6 @@ class ChatGPTScraper:
             except: 
                 pass
             raise e
-
-    async def _warmup_trust(self, page: Page):
-        """Generates trusted input events before the query is submitted to avoid bot detection."""
-        print("🌱 Warming up trust with natural interactions...")
-        try:
-            # Scroll slowly a few times
-            for _ in range(random.randint(2, 3)):
-                await page.mouse.wheel(0, random.randint(100, 300))
-                await asyncio.sleep(random.uniform(0.1, 0.3))
-                
-            # Natural mouse movement arc
-            width = await page.evaluate("window.innerWidth")
-            height = await page.evaluate("window.innerHeight")
-            start_x = width * 0.1
-            start_y = height * 0.1
-            end_x = width * 0.8
-            end_y = height * 0.8
-            
-            await page.mouse.move(start_x, start_y)
-            await asyncio.sleep(0.1)
-            await page.mouse.move(end_x, end_y, steps=20)
-            
-            await asyncio.sleep(random.uniform(2, 4))
-        except Exception as e:
-            print(f"⚠️ Warning: trust warmup encountered an issue: {e}")
 
     async def _kill_overlays(self, page: Page):
         await asyncio.sleep(2)
