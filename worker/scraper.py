@@ -8,6 +8,7 @@ from datetime import datetime
 from dataclasses import dataclass
 from typing import List, Optional
 from playwright.async_api import Page, async_playwright
+from playwright_stealth import Stealth
 
 # ==================== DATA MODELS ====================
 
@@ -41,16 +42,25 @@ class ChatGPTSelectors:
     SOURCES_SIDEBAR = '[data-testid="screen-threadFlyOut"]'
     
     OVERLAY_SELECTORS = [
-        'div[role="dialog"] button[aria-label="Close"]', 
-        'button:has-text("Stay logged out")',             
+        # Cookie consent banners (must be first — dismissing these raises trust score)
+        'button:has-text("Accept all")',
+        'button:has-text("Accept All")',
+        'button:has-text("Accept cookies")',
+        'button:has-text("Allow all cookies")',
+        'div#onetrust-banner-sdk button#onetrust-accept-btn-handler',
+        'button[id="accept-all-button"]',
+        # Upsell / login modals
+        'div[role="dialog"] button[aria-label="Close"]',
+        'button:has-text("Stay logged out")',
         'button:has-text("Dismiss")',
         'button:has-text("Maybe later")',
+        'button:has-text("No thanks")',
         'button:has-text("OK")',
         'button:has-text("Got it")',
         'div[id^="radix-"] button[aria-label="Close"]',
-        'button:has-text("Accept all")', # Cookie banner
-        'div#onetrust-banner-sdk button#onetrust-accept-btn-handler',
-        'button[id="accept-all-button"]'
+        # Any remaining modal close buttons
+        '[data-testid="modal-close-button"]',
+        'button[aria-label="Close dialog"]',
     ]
 
 # ==================== BROWSER MANAGER (NEW HEADLESS TRICK) ====================
@@ -61,40 +71,24 @@ class BrowserManager:
         self.playwright = None
         self.user_data_dir = user_data_dir 
         self.stealth_config = self._generate_stealth_config(user_data_dir)
-        
-        # Advanced stealth JS with realistic hardware fingerprints
-        self.stealth_js = f"""
-            // Platform and webdriver
-            Object.defineProperty(navigator, 'platform', {{ get: () => 'Win32' }});
-            Object.defineProperty(navigator, 'webdriver', {{ get: () => undefined }});
-            
-            // WebGL fingerprint
-            const getParameter = WebGLRenderingContext.prototype.getParameter;
-            WebGLRenderingContext.prototype.getParameter = function(parameter) {{
-                if (parameter === 37445) return '{self.stealth_config['gpu_vendor']}';
-                if (parameter === 37446) return '{self.stealth_config['gpu_renderer']}';
-                return getParameter(parameter);
-            }};
 
-            // Hardware specs
-            Object.defineProperty(navigator, 'hardwareConcurrency', {{ get: () => 4 }});
-            Object.defineProperty(navigator, 'deviceMemory', {{ get: () => 8 }});
+        # playwright-stealth v2: instantiate with GPU overrides so it patches
+        # WebGL vendor/renderer strings to look like a real Windows machine.
+        # platform, languages, webdriver, etc. are all handled by Stealth natively.
+        self._stealth = Stealth(
+            webgl_vendor_override=self.stealth_config['gpu_vendor'],
+            webgl_renderer_override=self.stealth_config['gpu_renderer'],
+            navigator_platform_override='Win32',
+            navigator_languages_override=('en-US', 'en'),
+        )
+        # Custom stealth JS: only patch things playwright-stealth v2 does NOT cover.
+        # (platform, languages, webdriver, WebGL are all handled by self._stealth above)
+        self.stealth_js = f"""
+            // Hardware specs (not natively overridden by playwright-stealth v2 config)
+            Object.defineProperty(navigator, 'hardwareConcurrency', {{ get: () => {self.stealth_config['cores']} }});
+            Object.defineProperty(navigator, 'deviceMemory', {{ get: () => {self.stealth_config['memory']} }});
             
-            // Chrome runtime (make it look like real Chrome)
-            window.chrome = {{ 
-                runtime: {{}}, 
-                app: {{}}, 
-                csi: function(){{}}, 
-                loadTimes: function(){{}} 
-            }};
-            
-            // Languages
-            Object.defineProperty(navigator, 'languages', {{ get: () => ['en-US', 'en'] }});
-            
-            // Remove automation markers
-            delete navigator.__proto__.webdriver;
-            
-            // Permissions API
+            // Permissions API (belt-and-suspenders)
             const originalQuery = window.navigator.permissions.query;
             window.navigator.permissions.query = (parameters) => (
                 parameters.name === 'notifications' ?
@@ -149,16 +143,15 @@ class BrowserManager:
                 '--no-sandbox',
                 '--disable-setuid-sandbox', # CRITICAL FOR DOCKER
                 '--disable-dev-shm-usage',
-                '--disable-infobars', 
+                '--disable-infobars',
                 '--disable-notifications',
-                '--start-maximized',
                 '--window-size=1920,1080',
                 '--ignore-certificate-errors',
-                '--run-all-compositor-stages-before-draw',
-                '--disable-partial-raster',
-                '--font-render-hinting=none',
-                '--disable-font-subpixel-positioning',
-                '--use-gl=swiftshader'
+                '--use-gl=angle',                 # Use ANGLE — NOT SwiftShader (which is a bot signal)
+                '--use-angle=swiftshader-webgl',  # Only swiftshader for WebGL fallback, not primary GL
+                '--enable-webgl',
+                '--hide-scrollbars',
+                '--mute-audio',
             ]
             
             # Add the magic flag for headless mode
@@ -190,7 +183,7 @@ class BrowserManager:
             )
 
     async def get_page(self) -> Page:
-        if not self.context: 
+        if not self.context:
             await self.start()
         
         if len(self.context.pages) > 0:
@@ -198,6 +191,11 @@ class BrowserManager:
         else:
             page = await self.context.new_page()
         
+        # Apply playwright-stealth v2 FIRST — patches canvas, WebGL, AudioContext,
+        # fonts, and 40+ other fingerprinting signals before any navigation.
+        await self._stealth.apply_stealth_async(page)
+        
+        # Then layer our supplemental stealth JS (hardwareConcurrency, deviceMemory)
         await page.add_init_script(self.stealth_js)
         page.set_default_timeout(60000)
         return page
@@ -358,19 +356,28 @@ class ChatGPTScraper:
             raise e
 
     async def _kill_overlays(self, page: Page):
+        # First pass — catch banners that appear on initial load
         await asyncio.sleep(2)
+        await self._dismiss_overlays_pass(page)
+        
+        # Second pass — catch banners that re-render or appear after first pass
+        await asyncio.sleep(1.5)
+        await self._dismiss_overlays_pass(page)
+        
+        await page.keyboard.press("Escape")
+        await asyncio.sleep(0.5)
+
+    async def _dismiss_overlays_pass(self, page: Page):
         for selector in self.selectors.OVERLAY_SELECTORS:
             try:
                 elements = page.locator(selector)
                 if await elements.count() > 0:
                     if await elements.first.is_visible():
-                        print(f"   -> Clicking overlay button: {selector}")
+                        print(f"   -> Clicking overlay: {selector}")
                         await elements.first.click(force=True)
                         await asyncio.sleep(0.5)
             except:
                 pass
-        await page.keyboard.press("Escape")
-        await asyncio.sleep(0.5)
 
     async def _submit_query(self, page: Page, query: str):
         print("⌨️ Inputting query with new locators...")
@@ -433,6 +440,33 @@ class ChatGPTScraper:
                 break
             await asyncio.sleep(1)
         await asyncio.sleep(1)
+
+        # --- SHADOW BLOCK DETECTION ---
+        # A shadow-blocked response has the container element but zero text nodes.
+        # Detect this immediately rather than wasting time in _extract_text().
+        await asyncio.sleep(1)  # Brief settle time
+        response_containers = page.locator(self.selectors.RESPONSE_CONTAINER)
+        container_count = await response_containers.count()
+
+        if container_count > 0:
+            last_container = response_containers.nth(container_count - 1)
+            text_content = await last_container.evaluate('''(el) => {
+                const walker = document.createTreeWalker(
+                    el, NodeFilter.SHOW_TEXT, null
+                );
+                let text = '';
+                let node;
+                while (node = walker.nextNode()) {
+                    text += node.textContent.trim();
+                }
+                return text;
+            }''')
+
+            if len(text_content.strip()) == 0:
+                raise Exception(
+                    "Shadow Block: Response container exists but contains zero "
+                    "text. ChatGPT detected automation and served empty stream."
+                )
 
     async def _wait_for_sources_button(self, page: Page):
         print("🔍 Scanning for Sources button...")

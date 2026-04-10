@@ -13,6 +13,9 @@ RUN apt-get update && apt-get install -y \
     fonts-noto \
     libfontconfig1 \
     libfreetype6 \
+    libgl1-mesa-glx \
+    libgl1-mesa-dri \
+    mesa-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements and install Python dependencies
