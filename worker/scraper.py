@@ -69,133 +69,292 @@ class BrowserManager:
     def __init__(self, user_data_dir: str):
         self.context = None
         self.playwright = None
-        self.user_data_dir = user_data_dir 
+        self.user_data_dir = user_data_dir
         self.stealth_config = self._generate_stealth_config(user_data_dir)
 
-        # playwright-stealth v2: instantiate with GPU overrides so it patches
-        # WebGL vendor/renderer strings to look like a real Windows machine.
-        # platform, languages, webdriver, etc. are all handled by Stealth natively.
+        # playwright-stealth v2: configured with real Windows GPU strings.
+        # We hook it onto the playwright context (not per-page) so stealth
+        # scripts are injected before ANY page navigation occurs.
         self._stealth = Stealth(
             webgl_vendor_override=self.stealth_config['gpu_vendor'],
             webgl_renderer_override=self.stealth_config['gpu_renderer'],
             navigator_platform_override='Win32',
             navigator_languages_override=('en-US', 'en'),
+            navigator_user_agent_override=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
         )
-        # Custom stealth JS: only patch things playwright-stealth v2 does NOT cover.
-        # (platform, languages, webdriver, WebGL are all handled by self._stealth above)
+
+        # Deep supplemental stealth JS — patches signals that playwright-stealth v2
+        # does NOT cover. Applied as an init-script so it runs before page JS.
         self.stealth_js = f"""
-            // Hardware specs (not natively overridden by playwright-stealth v2 config)
-            Object.defineProperty(navigator, 'hardwareConcurrency', {{ get: () => {self.stealth_config['cores']} }});
-            Object.defineProperty(navigator, 'deviceMemory', {{ get: () => {self.stealth_config['memory']} }});
-            
-            // Permissions API (belt-and-suspenders)
-            const originalQuery = window.navigator.permissions.query;
-            window.navigator.permissions.query = (parameters) => (
-                parameters.name === 'notifications' ?
-                    Promise.resolve({{ state: Notification.permission }}) :
-                    originalQuery(parameters)
-            );
+        (() => {{
+            // ── navigator.platform / webdriver ────────────────────────────
+            // Belt-and-suspenders: playwright-stealth sets these but we
+            // override again to guard against race conditions with init scripts.
+            try {{
+                Object.defineProperty(navigator, 'platform',  {{ get: () => 'Win32' }});
+                Object.defineProperty(navigator, 'webdriver', {{ get: () => false }});
+                delete navigator.__proto__.webdriver;
+            }} catch(e) {{}}
+
+            // ── Hardware specs ────────────────────────────────────────────
+            try {{
+                Object.defineProperty(navigator, 'hardwareConcurrency', {{ get: () => {self.stealth_config['cores']} }});
+                Object.defineProperty(navigator, 'deviceMemory',        {{ get: () => {self.stealth_config['memory']} }});
+            }} catch(e) {{}}
+
+            // ── Chrome runtime object ─────────────────────────────────────
+            // Some WAFs check for the absence of window.chrome.
+            try {{
+                if (!window.chrome) {{
+                    window.chrome = {{
+                        runtime: {{
+                            id: undefined,
+                            onMessage: {{ addListener: () => {{}}, removeListener: () => {{}} }},
+                            sendMessage: () => {{}},
+                        }},
+                        app: {{ isInstalled: false }},
+                        csi: () => {{}},
+                        loadTimes: () => ({{}}),
+                    }};
+                }}
+            }} catch(e) {{}}
+
+            // ── Screen dimensions ─────────────────────────────────────────
+            // Headless Chrome reports screen.width/height as 0 by default.
+            try {{
+                Object.defineProperty(screen, 'width',       {{ get: () => 1920 }});
+                Object.defineProperty(screen, 'height',      {{ get: () => 1080 }});
+                Object.defineProperty(screen, 'availWidth',  {{ get: () => 1920 }});
+                Object.defineProperty(screen, 'availHeight', {{ get: () => 1040 }});
+                Object.defineProperty(screen, 'colorDepth',  {{ get: () => 24   }});
+                Object.defineProperty(screen, 'pixelDepth',  {{ get: () => 24   }});
+            }} catch(e) {{}}
+
+            // ── Permissions API ───────────────────────────────────────────
+            try {{
+                const _origQuery = window.navigator.permissions.query;
+                window.navigator.permissions.query = (params) =>
+                    params.name === 'notifications'
+                        ? Promise.resolve({{ state: Notification.permission }})
+                        : _origQuery(params);
+            }} catch(e) {{}}
+
+            // ── Battery API (return a fake, fully-charged battery) ────────
+            try {{
+                navigator.getBattery = () => Promise.resolve({{
+                    charging: true, chargingTime: 0, dischargingTime: Infinity,
+                    level: 1.0, addEventListener: () => {{}},
+                }});
+            }} catch(e) {{}}
+
+            // ── Network Information API ────────────────────────────────────
+            try {{
+                Object.defineProperty(navigator, 'connection', {{
+                    get: () => ({{
+                        effectiveType: '4g', rtt: 50, downlink: 10,
+                        saveData: false, addEventListener: () => {{}},
+                    }}),
+                }});
+            }} catch(e) {{}}
+
+            // ── Plugin / mimeType arrays ──────────────────────────────────
+            // Real Chrome has plugins; headless has none.
+            try {{
+                const makePlugin = (name, desc, filename) => ({{
+                    name, description: desc, filename,
+                    length: 1, item: () => null, namedItem: () => null,
+                }});
+                const plugins = [
+                    makePlugin('Chrome PDF Plugin', 'Portable Document Format', 'internal-pdf-viewer'),
+                    makePlugin('Chrome PDF Viewer',  '',                         'mhjfbmdgcfjbbpaeojofohoefgiehjai'),
+                    makePlugin('Native Client',       '',                         'internal-nacl-plugin'),
+                ];
+                Object.defineProperty(navigator, 'plugins', {{ get: () => plugins }});
+                Object.defineProperty(navigator, 'mimeTypes', {{
+                    get: () => (['application/pdf', 'application/x-google-chrome-pdf']
+                        .map(type => ({{ type, suffixes: 'pdf', description: '', enabledPlugin: plugins[0] }})))
+                }});
+            }} catch(e) {{}}
+
+            // ── Canvas / WebGL noise ──────────────────────────────────────
+            // Inject a stable, tiny noise offset into canvas pixel data so
+            // every "machine" produces a unique fingerprint rather than the
+            // identical Mesa-llvmpipe hash that WAFs have on deny-lists.
+            try {{
+                const _toDataURL = HTMLCanvasElement.prototype.toDataURL;
+                const _getImageData = CanvasRenderingContext2D.prototype.getImageData;
+                const NOISE = {self.stealth_config['canvas_noise']};
+                HTMLCanvasElement.prototype.toDataURL = function(...args) {{
+                    const ctx = this.getContext('2d');
+                    if (ctx) {{
+                        const imageData = ctx.getImageData(0, 0, this.width || 1, this.height || 1);
+                        for (let i = 0; i < imageData.data.length; i += 4) {{
+                            imageData.data[i]     = Math.min(255, imageData.data[i]     + NOISE[i % NOISE.length]);
+                            imageData.data[i + 1] = Math.min(255, imageData.data[i + 1] + NOISE[(i+1) % NOISE.length]);
+                        }}
+                        ctx.putImageData(imageData, 0, 0);
+                    }}
+                    return _toDataURL.apply(this, args);
+                }};
+            }} catch(e) {{}}
+
+        }})();
         """
 
     def _generate_stealth_config(self, seed_string: str) -> dict:
-        """Generate consistent hardware fingerprint based on user_data_dir"""
+        """Generate a consistent, realistic hardware fingerprint seeded from the profile path."""
         seed_val = int(hashlib.sha256(seed_string.encode('utf-8')).hexdigest(), 16)
-        random.seed(seed_val)
-        
-        # Real GPU strings from actual Windows machines
+        rng = random.Random(seed_val)  # use local RNG — never pollute global state
+
         gpus = [
             ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
             ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce RTX 3070 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
             ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 SUPER Direct3D11 vs_5_0 ps_5_0, D3D11)"),
-            ("Google Inc. (Intel)", "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+            ("Google Inc. (Intel)",  "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+            ("Google Inc. (AMD)",    "ANGLE (AMD, Radeon RX 580 Series Direct3D11 vs_5_0 ps_5_0, D3D11)"),
         ]
-        vendor, renderer = random.choice(gpus)
-        
+        vendor, renderer = rng.choice(gpus)
+
+        # Stable per-profile canvas noise array (8 tiny values, 0-3)
+        canvas_noise = [rng.randint(0, 3) for _ in range(8)]
+
         return {
-            "cores": random.choice([8, 12, 16]),
-            "memory": random.choice([16, 32]),
-            "gpu_vendor": vendor,
-            "gpu_renderer": renderer
+            "cores":        rng.choice([4, 8, 12, 16]),
+            "memory":       rng.choice([8, 16, 32]),
+            "gpu_vendor":   vendor,
+            "gpu_renderer": renderer,
+            "canvas_noise": canvas_noise,
         }
 
     async def start(self):
-        if self.context is None:
-            self.playwright = await async_playwright().start()
-            
-            headless = os.environ.get("HEADLESS", "true").lower() == "true"
-            
-            proxy = None
-            if os.environ.get("PROXY_SERVER"):
-                proxy = {
-                    "server": os.environ.get("PROXY_SERVER"),
-                    "username": os.environ.get("PROXY_USERNAME"),
-                    "password": os.environ.get("PROXY_PASSWORD")
-                }
+        if self.context is not None:
+            return
 
-            print(f"🚀 Launching Browser (Mode: {'New Headless' if headless else 'Headed'})")
-            
-            # THE "NEW HEADLESS" TRICK:
-            # Set headless=False in Playwright but pass --headless=new to Chrome
-            # This forces Chrome to render full UI engine in background
-            
-            launch_args = [
-                '--disable-blink-features=AutomationControlled',
-                '--no-sandbox',
-                '--disable-setuid-sandbox', # CRITICAL FOR DOCKER
-                '--disable-dev-shm-usage',
-                '--disable-infobars',
-                '--disable-notifications',
-                '--window-size=1920,1080',
-                '--ignore-certificate-errors',
-                '--use-gl=angle',                 # Use ANGLE — NOT SwiftShader (which is a bot signal)
-                '--use-angle=swiftshader-webgl',  # Only swiftshader for WebGL fallback, not primary GL
-                '--enable-webgl',
-                '--hide-scrollbars',
-                '--mute-audio',
-            ]
-            
-            # Add the magic flag for headless mode
-            if headless:
-                launch_args.append("--headless=new")
+        self.playwright = await async_playwright().start()
 
-            self.context = await self.playwright.chromium.launch_persistent_context(
-                user_data_dir=self.user_data_dir,
-                headless=False, # We keep this False and pass --headless=new in args
-                args=launch_args,
-                ignore_default_args=['--enable-automation'],
-                viewport={"width": 1920, "height": 1080},
-                extra_http_headers={
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                    'Accept-Encoding': 'gzip, deflate, br',
-                    'DNT': '1', 
-                    'Connection': 'keep-alive',
-                    'Upgrade-Insecure-Requests': '1',
-                    'Sec-Fetch-Dest': 'document',
-                    'Sec-Fetch-Mode': 'navigate',
-                    'Sec-Fetch-Site': 'none',
-                    'Cache-Control': 'max-age=0'
-                },
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                proxy=proxy,
-                locale="en-US",
-                timezone_id="America/New_York",
-                color_scheme="light",
-            )
+        # Hook stealth onto the playwright instance so every context/page
+        # that this playwright object creates gets stealth patches applied.
+        self._stealth.hook_playwright_context(self.playwright)
+
+        headless = os.environ.get("HEADLESS", "true").lower() == "true"
+
+        proxy = None
+        if os.environ.get("PROXY_SERVER"):
+            proxy = {
+                "server":   os.environ.get("PROXY_SERVER"),
+                "username": os.environ.get("PROXY_USERNAME"),
+                "password": os.environ.get("PROXY_PASSWORD"),
+            }
+
+        print(f"Launching Browser (Mode: {'New Headless' if headless else 'Headed'})")
+
+        # ── Chromium launch arguments ─────────────────────────────────────
+        # Ordered from highest to lowest stealth priority.
+        launch_args = [
+            # Anti-detection essentials
+            '--disable-blink-features=AutomationControlled',
+            '--exclude-switches=enable-automation',
+
+            # Sandbox / Docker
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+
+            # Headless rendering (do not use --disable-gpu — that triggers Mesa fallbacks)
+            '--use-gl=angle',
+            '--use-angle=swiftshader',   # full swiftshader, not just WebGL
+            '--enable-webgl',
+            '--enable-webgl2',
+
+            # Window / display
+            '--window-size=1920,1080',
+            '--start-maximized',
+            '--hide-scrollbars',
+            '--mute-audio',
+            '--force-device-scale-factor=1',
+
+            # Network / privacy
+            '--ignore-certificate-errors',
+            '--disable-notifications',
+            '--disable-infobars',
+            '--disable-popup-blocking',
+            '--disable-extensions',
+            '--disable-component-extensions-with-background-pages',
+
+            # Performance (don't interfere with fingerprint)
+            '--disable-background-timer-throttling',
+            '--disable-backgrounding-occluded-windows',
+            '--disable-renderer-backgrounding',
+        ]
+
+        if headless:
+            launch_args.append('--headless=new')
+
+        # ── Launch with per-argument crash diagnostics ────────────────────
+        launch_kwargs = dict(
+            user_data_dir=self.user_data_dir,
+            headless=False,   # keep False; headless=new is passed in args above
+            args=launch_args,
+            ignore_default_args=['--enable-automation'],
+            viewport={"width": 1920, "height": 1080},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            extra_http_headers={
+                'Accept':                  'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                'Accept-Encoding':         'gzip, deflate, br',
+                'Accept-Language':         'en-US,en;q=0.9',
+                'DNT':                     '1',
+                'Connection':              'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+                'Sec-Fetch-Dest':          'document',
+                'Sec-Fetch-Mode':          'navigate',
+                'Sec-Fetch-Site':          'none',
+                'Cache-Control':           'max-age=0',
+            },
+            proxy=proxy,
+            locale="en-US",
+            timezone_id="America/New_York",
+            color_scheme="light",
+        )
+
+        try:
+            self.context = await self.playwright.chromium.launch_persistent_context(**launch_kwargs)
+        except Exception as launch_err:
+            # Diagnostic: retry stripping args one-by-one to isolate the bad flag
+            print(f"LAUNCH FAILED: {launch_err}")
+            print("Attempting diagnostic strip of launch_args to find bad flag...")
+            for bad_flag in launch_args:
+                try:
+                    stripped = [a for a in launch_args if a != bad_flag]
+                    self.context = await self.playwright.chromium.launch_persistent_context(
+                        **{**launch_kwargs, 'args': stripped}
+                    )
+                    print(f"SUCCESS after removing: {bad_flag}")
+                    break
+                except Exception:
+                    print(f"  Still failing without: {bad_flag}")
+            else:
+                raise RuntimeError(
+                    f"Browser failed to launch even after stripping all custom args. "
+                    f"Original error: {launch_err}"
+                )
 
     async def get_page(self) -> Page:
         if not self.context:
             await self.start()
-        
-        if len(self.context.pages) > 0:
-            page = self.context.pages[0]
-        else:
-            page = await self.context.new_page()
-        
-        # Apply playwright-stealth v2 FIRST — patches canvas, WebGL, AudioContext,
-        # fonts, and 40+ other fingerprinting signals before any navigation.
-        await self._stealth.apply_stealth_async(page)
-        
-        # Then layer our supplemental stealth JS (hardwareConcurrency, deviceMemory)
+
+        page = self.context.pages[0] if self.context.pages else await self.context.new_page()
+
+        # Supplemental stealth JS layered on top of playwright-stealth's patches.
+        # Covers: platform, webdriver, chrome runtime, screen dims, battery,
+        # connection API, plugins, mimeTypes, and canvas noise.
         await page.add_init_script(self.stealth_js)
         page.set_default_timeout(60000)
         return page
