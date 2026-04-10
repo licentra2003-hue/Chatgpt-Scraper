@@ -9,6 +9,10 @@ RUN apt-get update && apt-get install -y \
     wget \
     gnupg \
     ca-certificates \
+    fonts-liberation \
+    fonts-noto \
+    libfontconfig1 \
+    libfreetype6 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements and install Python dependencies
@@ -31,6 +35,7 @@ USER pwuser
 ENV PYTHONPATH=/app
 ENV PROFILES_DIR=/app/profiles
 ENV PYTHONUNBUFFERED=1
+ENV FONTCONFIG_PATH=/etc/fonts
 
 # Expose health check port (optional)
 EXPOSE 8000

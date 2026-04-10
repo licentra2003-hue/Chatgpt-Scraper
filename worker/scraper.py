@@ -47,7 +47,10 @@ class ChatGPTSelectors:
         'button:has-text("Maybe later")',
         'button:has-text("OK")',
         'button:has-text("Got it")',
-        'div[id^="radix-"] button[aria-label="Close"]'    
+        'div[id^="radix-"] button[aria-label="Close"]',
+        'button:has-text("Accept all")', # Cookie banner
+        'div#onetrust-banner-sdk button#onetrust-accept-btn-handler',
+        'button[id="accept-all-button"]'
     ]
 
 # ==================== BROWSER MANAGER (NEW HEADLESS TRICK) ====================
@@ -150,7 +153,12 @@ class BrowserManager:
                 '--disable-notifications',
                 '--start-maximized',
                 '--window-size=1920,1080',
-                '--ignore-certificate-errors'
+                '--ignore-certificate-errors',
+                '--run-all-compositor-stages-before-draw',
+                '--disable-partial-raster',
+                '--font-render-hinting=none',
+                '--disable-font-subpixel-positioning',
+                '--use-gl=swiftshader'
             ]
             
             # Add the magic flag for headless mode
@@ -162,7 +170,7 @@ class BrowserManager:
                 headless=False, # We keep this False and pass --headless=new in args
                 args=launch_args,
                 ignore_default_args=['--enable-automation'],
-                no_viewport=True, # PREVENT VIEWPORT MISMATCH Detection
+                viewport={"width": 1920, "height": 1080},
                 extra_http_headers={
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
                     'Accept-Encoding': 'gzip, deflate, br',
@@ -449,10 +457,32 @@ class ChatGPTScraper:
             if await markdown_div.count() == 0:
                 # Fallback to inner_text
                 print("   ⚠️ No markdown div found, using fallback")
-                await page.screenshot(path="/app/debug_docker_fallback.png")
+                try:
+                    await page.screenshot(path="/app/debug_docker_fallback.png")
+                except:
+                    pass
                 text = await last_msg.inner_text()
+                text = text.strip()
+                if not text:
+                    print("   ⚠️ inner_text returned empty, using TreeWalker fallback")
+                    text = await last_msg.evaluate('''(element) => {
+                        const walker = document.createTreeWalker(
+                            element,
+                            NodeFilter.SHOW_TEXT,
+                            null
+                        );
+                        let text = '';
+                        let node;
+                        while (node = walker.nextNode()) {
+                            text += node.textContent;
+                        }
+                        return text;
+                    }''')
+                    text = text.strip()
+                    if text:
+                        print(f"   ✅ TreeWalker fallback SUCCESS: Extracted {len(text)} chars")
                 print(f"   💬 Fallback text length: {len(text)}")
-                return text.strip()
+                return text
             
             clean_text = await markdown_div.first.evaluate('''(element) => {
                 const clone = element.cloneNode(true);
@@ -467,7 +497,26 @@ class ChatGPTScraper:
                 });
                 return clone.innerText;
             }''')
-            return clean_text.strip()
+            clean_text = clean_text.strip()
+            
+            if not clean_text:
+                print("   ⚠️ innerText returned empty, using TreeWalker fallback")
+                clean_text = await markdown_div.first.evaluate('''(element) => {
+                    const walker = document.createTreeWalker(
+                        element,
+                        NodeFilter.SHOW_TEXT,
+                        null
+                    );
+                    let text = '';
+                    let node;
+                    while (node = walker.nextNode()) {
+                        text += node.textContent;
+                    }
+                    return text;
+                }''')
+                clean_text = clean_text.strip()
+
+            return clean_text
         except Exception as e:
             print(f"   ❌ Text extraction error: {e}")
             return ""
