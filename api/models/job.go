@@ -7,7 +7,9 @@ import (
 )
 
 type ScrapeRequest struct {
-	Query string `json:"query"`
+	Query      string  `json:"query"`
+	ProductID  *string `json:"product_id,omitempty"`
+	SnapshotID *string `json:"snapshot_id,omitempty"`
 }
 
 type Job struct {
@@ -17,11 +19,15 @@ type Job struct {
 	ResultJSON *string   `json:"result_json,omitempty" db:"result_json"`
 	CreatedAt  time.Time `json:"created_at" db:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at" db:"updated_at"`
+	ProductID  *string   `json:"product_id,omitempty"`
+	SnapshotID *string   `json:"snapshot_id,omitempty"`
 }
 
 type QueueMessage struct {
-	JobID uuid.UUID `json:"job_id"`
-	Query string    `json:"query"`
+	JobID      uuid.UUID `json:"job_id"`
+	Query      string    `json:"query"`
+	ProductID  *string   `json:"product_id,omitempty"`
+	SnapshotID *string   `json:"snapshot_id,omitempty"`
 }
 
 type ScrapeResponse struct {

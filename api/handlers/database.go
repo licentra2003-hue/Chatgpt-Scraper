@@ -123,7 +123,7 @@ func (d *Database) restRequest(method string, path string, body any) (*http.Resp
 	return http.DefaultClient.Do(req)
 }
 
-func (d *Database) CreateJob(query string) (*models.Job, error) {
+func (d *Database) CreateJob(query string, productID, snapshotID *string) (*models.Job, error) {
 	// Mock database implementation
 	if d.db == nil {
 		if d.restURL != "" {
@@ -146,21 +146,25 @@ func (d *Database) CreateJob(query string) (*models.Job, error) {
 			}
 
 			return &models.Job{
-				ID:        jobID,
-				Query:     query,
-				Status:    "pending",
-				CreatedAt: time.Now(),
-				UpdatedAt: time.Now(),
+				ID:         jobID,
+				Query:      query,
+				Status:     "pending",
+				CreatedAt:  time.Now(),
+				UpdatedAt:  time.Now(),
+				ProductID:  productID,
+				SnapshotID: snapshotID,
 			}, nil
 		}
 
 		log.Printf("MOCK: Creating job with query: %s", query)
 		job := &models.Job{
-			ID:        uuid.New(),
-			Query:     query,
-			Status:    "pending",
-			CreatedAt: time.Now(),
-			UpdatedAt: time.Now(),
+			ID:         uuid.New(),
+			Query:      query,
+			Status:     "pending",
+			CreatedAt:  time.Now(),
+			UpdatedAt:  time.Now(),
+			ProductID:  productID,
+			SnapshotID: snapshotID,
 		}
 		log.Printf("MOCK: Created job %s", job.ID)
 		return job, nil
@@ -180,11 +184,13 @@ func (d *Database) CreateJob(query string) (*models.Job, error) {
 	}
 
 	return &models.Job{
-		ID:        jobID,
-		Query:     query,
-		Status:    "pending",
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
+		ID:         jobID,
+		Query:      query,
+		Status:     "pending",
+		CreatedAt:  time.Now(),
+		UpdatedAt:  time.Now(),
+		ProductID:  productID,
+		SnapshotID: snapshotID,
 	}, nil
 }
 
@@ -192,7 +198,7 @@ func (d *Database) GetJob(jobID uuid.UUID) (*models.Job, error) {
 	// Mock database implementation
 	if d.db == nil {
 		if d.restURL != "" {
-			resp, err := d.restRequest("GET", "/processed_jobs?select=job_id,processed_at,expires_at,engine&job_id=eq."+jobID.String(), nil)
+			resp, err := d.restRequest("GET", "/processed_jobs?select=job_id,processed_at,expires_at,engine,status&job_id=eq."+jobID.String(), nil)
 			if err != nil {
 				return nil, fmt.Errorf("failed to get job via Supabase REST: %w", err)
 			}
@@ -214,7 +220,11 @@ func (d *Database) GetJob(jobID uuid.UUID) (*models.Job, error) {
 			}
 
 			status := "pending"
-			if rows[0]["processed_at"] != nil {
+			if s, ok := rows[0]["status"].(string); ok && s == "completed" {
+				status = "completed"
+			} else if s, ok := rows[0]["status"].(string); ok && s == "failed" {
+				status = "failed"
+			} else if rows[0]["processed_at"] != nil {
 				status = "completed"
 			}
 

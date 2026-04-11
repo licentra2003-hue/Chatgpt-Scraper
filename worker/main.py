@@ -18,6 +18,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 RABBITMQ_URL = os.getenv("RABBITMQ_URL")
 API_URL = os.getenv("API_URL", "http://api:3000")
+SAVE_IN_SUPABASE = os.getenv("SAVE_IN_SUPABASE", "false").lower() == "true"
 
 # Mock database fallback - if URL is mock or invalid, set supabase to None
 if SUPABASE_URL in ["mock://localhost", "your_supabase_url_here", "", None]:
@@ -36,6 +37,8 @@ async def process_job(ch, method, properties, body):
         data = json.loads(body)
         job_id = data.get("job_id")
         query = data.get("query")
+        product_id = data.get("product_id")
+        snapshot_id = data.get("snapshot_id")
 
         # Use a per-job persistent profile directory to isolate jobs.
         # This will be deleted at the end of the job (success or failure).
@@ -85,8 +88,26 @@ async def process_job(ch, method, properties, body):
                     "processed_at": datetime.now().isoformat(),
                     "expires_at": (datetime.now() + timedelta(hours=24)).isoformat(),
                     "engine": "Chatgpt",
+                    "status": "completed",
                 }).eq("job_id", str(job_id)).execute()
                 print(f"[{WORKER_ID}] Job {job_id} Completed.")
+
+                # Save to product_analysis_chatgpt if requested
+                if SAVE_IN_SUPABASE and product_id is not None:
+                    try:
+                        record = {
+                            "product_id": product_id,
+                            "optimization_prompt": query,
+                            "optimization_analysis": None,
+                            "citations": safe_result.get("source_links", []),
+                            "raw_serp_results": safe_result,
+                            "snapshot_id": snapshot_id
+                        }
+                        supabase.table("product_analysis_chatgpt").insert(record).execute()
+                        print(f"[{WORKER_ID}] Job {job_id} saved to product_analysis_chatgpt.")
+                    except Exception as ins_e:
+                        print(f"[{WORKER_ID}] Error saving to Supabase product_analysis_chatgpt: {ins_e}")
+
             else:
                 raise Exception(result.error_message)
 
