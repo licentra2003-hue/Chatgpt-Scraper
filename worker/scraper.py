@@ -79,18 +79,6 @@ class BrowserManager:
         self.user_data_dir = user_data_dir
         self.stealth_config = self._generate_stealth_config(user_data_dir)
 
-        # playwright-stealth v2: configured for Honest Linux Desktop.
-        # Platform, UA, and GPU all align with a real Ubuntu machine.
-        # We hook it onto the playwright context (not per-page) so stealth
-        # scripts are injected before ANY page navigation occurs.
-        self._stealth = Stealth(
-            webgl_vendor_override=self.stealth_config['gpu_vendor'],
-            webgl_renderer_override=self.stealth_config['gpu_renderer'],
-            navigator_platform_override='Linux x86_64',
-            navigator_languages_override=('en-US', 'en'),
-            navigator_user_agent_override=self.linux_ua,
-        )
-
         # Deep supplemental stealth JS — patches signals that playwright-stealth v2
         # does NOT cover or that were leaking in the Docker environment.
         self.stealth_js = f"""
@@ -280,15 +268,52 @@ class BrowserManager:
             "canvas_noise": canvas_noise,
         }
 
+    def _bezier_points(self, start, end, num_points=25):
+        """Generate cubic Bezier curve points between start and end."""
+        import random
+        sx, sy = start
+        ex, ey = end
+        
+        # Random control points that create a natural curve
+        cp1x = sx + (ex - sx) * random.uniform(0.2, 0.4) + random.randint(-80, 80)
+        cp1y = sy + (ey - sy) * random.uniform(0.1, 0.3) + random.randint(-80, 80)
+        cp2x = sx + (ex - sx) * random.uniform(0.6, 0.8) + random.randint(-80, 80)
+        cp2y = sy + (ey - sy) * random.uniform(0.7, 0.9) + random.randint(-80, 80)
+        
+        points = []
+        for i in range(num_points + 1):
+            t = i / num_points
+            # Cubic Bezier formula
+            x = (1-t)**3*sx + 3*(1-t)**2*t*cp1x + 3*(1-t)*t**2*cp2x + t**3*ex
+            y = (1-t)**3*sy + 3*(1-t)**2*t*cp1y + 3*(1-t)*t**2*cp2y + t**3*ey
+            points.append((int(x), int(y)))
+        return points
+
+    async def _bezier_move(self, page, start, end):
+        """Move mouse along a Bezier curve with variable speed."""
+        import random
+        points = self._bezier_points(start, end)
+        for i, (x, y) in enumerate(points):
+            await page.mouse.move(x, y)
+            # Variable speed: faster in middle, slower at start/end
+            progress = i / len(points)
+            speed_factor = 4 * progress * (1 - progress)  # parabola
+            delay = random.uniform(0.005, 0.02) / (speed_factor + 0.1)
+            await asyncio.sleep(delay)
+
     async def start(self):
         if self.context is not None:
             return
 
         self.playwright = await async_playwright().start()
 
-        # Hook stealth onto the playwright instance so every context/page
-        # that this playwright object creates gets stealth patches applied.
-        self._stealth.hook_playwright_context(self.playwright)
+        self._stealth = Stealth(
+            webgl_vendor_override=self.stealth_config['gpu_vendor'],
+            webgl_renderer_override=self.stealth_config['gpu_renderer'],
+            navigator_platform_override='Linux x86_64',
+            navigator_languages_override=('en-US', 'en'),
+            navigator_user_agent_override=self.linux_ua,
+        )
 
         headless = os.environ.get("HEADLESS", "true").lower() == "true"
 
@@ -318,7 +343,7 @@ class BrowserManager:
 
             # Headless rendering (Mesa optimization)
             '--use-gl=angle',
-            '--use-angle=gl',            # Switch from swiftshader to Mesa GL for higher fidelity
+            '--use-angle=swiftshader',            # Switch from swiftshader to Mesa GL for higher fidelity
             '--enable-webgl',
             '--enable-webgl2',
             '--enable-accelerated-2d-canvas',
@@ -381,6 +406,7 @@ class BrowserManager:
 
         try:
             self.context = await self.playwright.chromium.launch_persistent_context(**launch_kwargs)
+            await self._stealth.apply_stealth_async(self.context)
         except Exception as launch_err:
             # Diagnostic: retry stripping args one-by-one to isolate the bad flag
             print(f"LAUNCH FAILED: {launch_err}")
@@ -391,6 +417,7 @@ class BrowserManager:
                     self.context = await self.playwright.chromium.launch_persistent_context(
                         **{**launch_kwargs, 'args': stripped}
                     )
+                    await self._stealth.apply_stealth_async(self.context)
                     print(f"SUCCESS after removing: {bad_flag}")
                     break
                 except Exception:
@@ -434,83 +461,72 @@ class BrowserManager:
 # ==================== PROFILE MANAGER ====================
 
 class ProfileManager:
-    """
-    Manages a PERSISTENT browser profile for the worker.
-
-    Key insight: ephemeral profiles have a zero trust score with Cloudflare
-    because they carry no cookies, no TLS session tickets, and no browsing
-    history. By keeping a single stable directory alive forever, the browser
-    accumulates cf_clearance tokens, ChatGPT device-recognition cookies, and
-    organic third-party cookies that age naturally — exactly what a real
-    long-term user looks like.
-    """
-
-    PERSISTENT_PROFILE_NAME = "worker_persistent_profile"
-
+    """Manages temporary browser profiles for concurrent scraping"""
+    
     def __init__(self, base_profiles_dir: str = "./profiles"):
         self.base_profiles_dir = base_profiles_dir
         os.makedirs(base_profiles_dir, exist_ok=True)
-
-    def get_persistent_profile(self) -> str:
-        """Return (and create if necessary) the single long-lived profile directory."""
-        profile_path = os.path.join(self.base_profiles_dir, self.PERSISTENT_PROFILE_NAME)
-        os.makedirs(profile_path, exist_ok=True)
-        print(f"♻️  Using persistent profile: {os.path.basename(profile_path)}")
-        return profile_path
-
-    # ----- Legacy helpers kept for API compatibility; deletion is now a no-op -----
-
+    
     def create_temp_profile(self, job_id: str) -> str:
-        """Compatibility shim — now returns the persistent profile."""
-        return self.get_persistent_profile()
-
+        """Create a temporary profile directory for a specific job"""
+        profile_path = os.path.join(self.base_profiles_dir, f"temp_{job_id}")
+        os.makedirs(profile_path, exist_ok=True)
+        return profile_path
+    
     async def cleanup_temp_profile(self, job_id: str):
-        """No-op: we intentionally keep the profile alive to preserve cookies."""
-        print(f"🔒 Preserving persistent profile (not deleting for job {job_id}).")
-
+        """Clean up a temporary profile directory"""
+        profile_path = os.path.join(self.base_profiles_dir, f"temp_{job_id}")
+        try:
+            if os.path.exists(profile_path):
+                shutil.rmtree(profile_path, ignore_errors=True)
+                print(f"🗑️ Cleaned up temp profile: temp_{job_id}")
+        except Exception as e:
+            print(f"⚠️ Could not clean up temp profile temp_{job_id}: {e}")
+    
     async def cleanup_all_temp_profiles(self):
-        """No-op: persistent profile must never be wiped by automated cleanup."""
-        print("🔒 Persistent profile retained — skipping automated wipe.")
+        """Clean up all temporary profiles"""
+        try:
+            if os.path.exists(self.base_profiles_dir):
+                for item in os.listdir(self.base_profiles_dir):
+                    if item.startswith("temp_"):
+                        item_path = os.path.join(self.base_profiles_dir, item)
+                        shutil.rmtree(item_path, ignore_errors=True)
+                        print(f"🗑️ Cleaned up temp profile: {item}")
+        except Exception as e:
+            print(f"⚠️ Could not clean up temp profiles: {e}")
 
 # ==================== SCRAPER WITH PROFILE MANAGEMENT ====================
 
 class ManagedChatGPTScraper:
-    """
-    Scraper that manages its own browser profile lifecycle.
-
-    Uses the ProfileManager's persistent profile so that cookies and TLS
-    session tickets survive across jobs. The browser is launched fresh each
-    time (so memory is clean) but loads the same on-disk profile, giving
-    Cloudflare continuity without the overhead of a long-running browser.
-    """
-
+    """Scraper that manages its own browser profile lifecycle"""
+    
     def __init__(self, profile_manager: ProfileManager, job_id: str):
         self.profile_manager = profile_manager
         self.job_id = job_id
         self.profile_path = None
         self.browser_manager = None
         self.scraper = ChatGPTScraper()
-
+    
     async def __aenter__(self):
-        """Resolve the persistent profile path and initialise the browser."""
-        self.profile_path = self.profile_manager.get_persistent_profile()
+        """Initialize browser profile when entering context"""
+        self.profile_path = self.profile_manager.create_temp_profile(self.job_id)
         self.browser_manager = BrowserManager(self.profile_path)
         return self
-
+    
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Close the browser but leave the profile directory untouched."""
+        """Clean up browser profile when exiting context"""
         try:
             if self.browser_manager:
                 await self.browser_manager.close()
+            await self.profile_manager.cleanup_temp_profile(self.job_id)
         except Exception as e:
-            print(f"⚠️ Error closing browser for job {self.job_id}: {e}")
-        # Profile is intentionally NOT deleted here.
-
+            print(f"⚠️ Error during cleanup for job {self.job_id}: {e}")
+    
     async def scrape(self, query: str) -> ScrapingResult:
-        """Scrape with automatic profile management."""
+        """Scrape with automatic profile management"""
         if not self.browser_manager:
             raise RuntimeError("Scraper not initialized. Use async context manager.")
-
+        
         page = await self.browser_manager.get_page()
         return await self.scraper.scrape(page, query, self.browser_manager)
 
@@ -523,50 +539,20 @@ class ChatGPTScraper:
     async def scrape(self, page: Page, query: str, browser_manager: Any = None) -> ScrapingResult:
 
         timestamp = datetime.now().isoformat()
-
+        
         try:
-            # --- Telemetry Block ---
+            # Telemetry Block
             if browser_manager:
-                await page.route(
-                    "**/*",
-                    lambda route: route.abort()
-                    if browser_manager._should_block_request(route.request)
-                    else route.continue_()
-                )
+                await page.route("**/*", lambda route: route.abort() if browser_manager._should_block_request(route.request) else route.continue_())
 
-            # ----------------------------------------------------------------
-            # PRE-FLIGHT WARM-UP
-            # Navigate to a high-trust benign site before touching ChatGPT.
-            # This has two benefits:
-            #   1. Establishes a real TLS session ticket with a well-known CA,
-            #      making our TLS fingerprint look like a live browsing session.
-            #   2. Seeds the browser with third-party cookies and a browsing
-            #      history entry — signals that Cloudflare weighs heavily in
-            #      its trust score.
-            # ----------------------------------------------------------------
-            WARMUP_URL = "https://en.wikipedia.org/wiki/Main_Page"
-            try:
-                print(f"🌐 Pre-flight warm-up: navigating to {WARMUP_URL}...")
-                await page.goto(WARMUP_URL, wait_until="domcontentloaded", timeout=20000)
-                await asyncio.sleep(random.uniform(2.0, 3.5))
-                # Brief, human-like interaction on the warm-up page
-                await page.mouse.move(
-                    random.randint(200, 800), random.randint(200, 500), steps=8
-                )
-                await page.mouse.wheel(0, random.randint(150, 400))
-                await asyncio.sleep(random.uniform(0.5, 1.2))
-                print("   ✓ Warm-up complete — TLS ticket established.")
-            except Exception as warmup_err:
-                # Non-fatal: log and continue to ChatGPT anyway
-                print(f"   ⚠️ Warm-up navigation failed (non-fatal): {warmup_err}")
 
             print(f"Navigating to {self.selectors.CHATGPT_URL}...")
             await page.goto(self.selectors.CHATGPT_URL, wait_until="domcontentloaded", timeout=60000)
-
-            # Settle period: let ChatGPT's fingerprinting scripts run and observe
-            # a naturally-paced session rather than an instant bot sequence.
+            
+            # Settle period: Allow the "Honest Linux" system to be poked by scripts
+            # and respond naturally before we start acting.
             print("⏳ Settling session...")
-            await asyncio.sleep(random.uniform(2.5, 4.0))
+            await asyncio.sleep(3.0) 
             
             # --- CLOUDFLARE CHECK ---
             try:
@@ -581,9 +567,9 @@ class ChatGPTScraper:
             await self._kill_overlays(page)
             
             print("🎭 Performing human warmup...")
-            await self._human_warmup(page)
+            await self._human_warmup(page, browser_manager)
             
-            await self._submit_query(page, query)
+            await self._submit_query(page, query, browser_manager)
             
             print("⏳ Waiting for response generation...")
             await self._wait_for_response(page)
@@ -647,14 +633,19 @@ class ChatGPTScraper:
             except:
                 pass
 
-    async def _human_warmup(self, page: Page):
+    async def _human_warmup(self, page: Page, browser_manager: Any):
         """Move mouse and scroll randomly to simulate human traffic."""
         try:
             # Random mouse movements
+            last_pos = (random.randint(10, 50), random.randint(10, 50))
             for _ in range(random.randint(3, 6)):
                 x = random.randint(100, 1000)
                 y = random.randint(100, 800)
-                await page.mouse.move(x, y, steps=random.randint(10, 20))
+                if browser_manager:
+                    await browser_manager._bezier_move(page, last_pos, (x, y))
+                else:
+                    await page.mouse.move(x, y, steps=random.randint(10, 20))
+                last_pos = (x, y)
                 await asyncio.sleep(random.uniform(0.1, 0.4))
             
             # Sublte scrolling
@@ -667,14 +658,19 @@ class ChatGPTScraper:
         except:
             pass
 
-    async def _submit_query(self, page: Page, query: str):
+    async def _submit_query(self, page: Page, query: str, browser_manager: Any):
         print("⌨️ Inputting query with new locators...")
         try:
             textarea = page.locator("#prompt-textarea")
             await textarea.wait_for(state="visible", timeout=15000)
             
             # Initial random mouse move
-            await page.mouse.move(random.randint(100, 500), random.randint(100, 500), steps=5)
+            start_pos = (random.randint(10, 50), random.randint(10, 50))
+            end_pos = (random.randint(100, 500), random.randint(100, 500))
+            if browser_manager:
+                await browser_manager._bezier_move(page, start_pos, end_pos)
+            else:
+                await page.mouse.move(end_pos[0], end_pos[1], steps=5)
             await asyncio.sleep(random.uniform(0.3, 0.8))
 
             await textarea.click(timeout=5000)
@@ -734,11 +730,12 @@ class ChatGPTScraper:
         
         # --- SHADOW BLOCK DETECTION ---
         # A shadow-blocked response has the container element but zero text nodes.
-        # We wait up to 10s for the first character to appear in the container.
         
         response_containers = page.locator(self.selectors.RESPONSE_CONTAINER)
         
-        for i in range(10):  # Wait up to 10s for text to start appearing
+        # Wait up to 15 seconds for text to appear
+        text_found = False
+        for i in range(15):
             container_count = await response_containers.count()
             if container_count > 0:
                 last_container = response_containers.nth(container_count - 1)
@@ -754,28 +751,20 @@ class ChatGPTScraper:
                     return text;
                 }''')
                 
-                if len(text_content.strip()) > 0:
-                    print(f"   ✓ Non-empty response detected ({len(text_content.strip())} chars)")
+                if len(text_content.strip()) > 5:  # At least a few chars
+                    print(f"   ✓ Response text detected: {len(text_content.strip())} chars")
+                    text_found = True
                     break
             
-            # If we still see 'result-streaming' but no text, it might just be slow
-            is_streaming = await page.locator('.result-streaming').count() > 0
-            if not is_streaming and i > 2:
-                # Not streaming and no text after 3 seconds? Likely blocked.
-                break
-                
+            print(f"   ⏳ Waiting for response... ({i+1}/15s)")
             await asyncio.sleep(1)
-        else:
-            # If loop finished without 'break', check one last time
-            container_count = await response_containers.count()
-            if container_count > 0:
-                last_container = response_containers.nth(container_count - 1)
-                text_content = await last_container.inner_text()
-                if not text_content.strip():
-                    raise Exception(
-                        "Shadow Block: Response container exists but contains zero "
-                        "text after 10s. ChatGPT detected automation."
-                    )
+        
+        if not text_found:
+            # Only NOW declare shadow block after 15 full seconds of waiting
+            raise Exception(
+                "Shadow Block: 15 seconds elapsed with zero text in response "
+                "container. ChatGPT detected automation and served empty stream."
+            )
         
         # Wait for streaming to FINISH
         for _ in range(max_retries):

@@ -1,5 +1,5 @@
 # Use official Playwright Python base image
-FROM mcr.microsoft.com/playwright/python:v1.48.0-jammy
+FROM mcr.microsoft.com/playwright/python:v1.58.0-jammy
 
 # Set working directory
 WORKDIR /app
@@ -66,8 +66,6 @@ ENV PYTHONPATH=/app
 ENV PROFILES_DIR=/app/profiles
 ENV PYTHONUNBUFFERED=1
 ENV FONTCONFIG_PATH=/etc/fonts
-ENV LIBGL_ALWAYS_SOFTWARE=1
-ENV MESA_DEBUG=silent
 
 # Expose health check port (optional)
 EXPOSE 8000
