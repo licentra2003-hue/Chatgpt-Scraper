@@ -434,72 +434,83 @@ class BrowserManager:
 # ==================== PROFILE MANAGER ====================
 
 class ProfileManager:
-    """Manages temporary browser profiles for concurrent scraping"""
-    
+    """
+    Manages a PERSISTENT browser profile for the worker.
+
+    Key insight: ephemeral profiles have a zero trust score with Cloudflare
+    because they carry no cookies, no TLS session tickets, and no browsing
+    history. By keeping a single stable directory alive forever, the browser
+    accumulates cf_clearance tokens, ChatGPT device-recognition cookies, and
+    organic third-party cookies that age naturally — exactly what a real
+    long-term user looks like.
+    """
+
+    PERSISTENT_PROFILE_NAME = "worker_persistent_profile"
+
     def __init__(self, base_profiles_dir: str = "./profiles"):
         self.base_profiles_dir = base_profiles_dir
         os.makedirs(base_profiles_dir, exist_ok=True)
-    
-    def create_temp_profile(self, job_id: str) -> str:
-        """Create a temporary profile directory for a specific job"""
-        profile_path = os.path.join(self.base_profiles_dir, f"temp_{job_id}")
+
+    def get_persistent_profile(self) -> str:
+        """Return (and create if necessary) the single long-lived profile directory."""
+        profile_path = os.path.join(self.base_profiles_dir, self.PERSISTENT_PROFILE_NAME)
         os.makedirs(profile_path, exist_ok=True)
+        print(f"♻️  Using persistent profile: {os.path.basename(profile_path)}")
         return profile_path
-    
+
+    # ----- Legacy helpers kept for API compatibility; deletion is now a no-op -----
+
+    def create_temp_profile(self, job_id: str) -> str:
+        """Compatibility shim — now returns the persistent profile."""
+        return self.get_persistent_profile()
+
     async def cleanup_temp_profile(self, job_id: str):
-        """Clean up a temporary profile directory"""
-        profile_path = os.path.join(self.base_profiles_dir, f"temp_{job_id}")
-        try:
-            if os.path.exists(profile_path):
-                shutil.rmtree(profile_path, ignore_errors=True)
-                print(f"🗑️ Cleaned up temp profile: temp_{job_id}")
-        except Exception as e:
-            print(f"⚠️ Could not clean up temp profile temp_{job_id}: {e}")
-    
+        """No-op: we intentionally keep the profile alive to preserve cookies."""
+        print(f"🔒 Preserving persistent profile (not deleting for job {job_id}).")
+
     async def cleanup_all_temp_profiles(self):
-        """Clean up all temporary profiles"""
-        try:
-            if os.path.exists(self.base_profiles_dir):
-                for item in os.listdir(self.base_profiles_dir):
-                    if item.startswith("temp_"):
-                        item_path = os.path.join(self.base_profiles_dir, item)
-                        shutil.rmtree(item_path, ignore_errors=True)
-                        print(f"🗑️ Cleaned up temp profile: {item}")
-        except Exception as e:
-            print(f"⚠️ Could not clean up temp profiles: {e}")
+        """No-op: persistent profile must never be wiped by automated cleanup."""
+        print("🔒 Persistent profile retained — skipping automated wipe.")
 
 # ==================== SCRAPER WITH PROFILE MANAGEMENT ====================
 
 class ManagedChatGPTScraper:
-    """Scraper that manages its own browser profile lifecycle"""
-    
+    """
+    Scraper that manages its own browser profile lifecycle.
+
+    Uses the ProfileManager's persistent profile so that cookies and TLS
+    session tickets survive across jobs. The browser is launched fresh each
+    time (so memory is clean) but loads the same on-disk profile, giving
+    Cloudflare continuity without the overhead of a long-running browser.
+    """
+
     def __init__(self, profile_manager: ProfileManager, job_id: str):
         self.profile_manager = profile_manager
         self.job_id = job_id
         self.profile_path = None
         self.browser_manager = None
         self.scraper = ChatGPTScraper()
-    
+
     async def __aenter__(self):
-        """Initialize browser profile when entering context"""
-        self.profile_path = self.profile_manager.create_temp_profile(self.job_id)
+        """Resolve the persistent profile path and initialise the browser."""
+        self.profile_path = self.profile_manager.get_persistent_profile()
         self.browser_manager = BrowserManager(self.profile_path)
         return self
-    
+
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Clean up browser profile when exiting context"""
+        """Close the browser but leave the profile directory untouched."""
         try:
             if self.browser_manager:
                 await self.browser_manager.close()
-            await self.profile_manager.cleanup_temp_profile(self.job_id)
         except Exception as e:
-            print(f"⚠️ Error during cleanup for job {self.job_id}: {e}")
-    
+            print(f"⚠️ Error closing browser for job {self.job_id}: {e}")
+        # Profile is intentionally NOT deleted here.
+
     async def scrape(self, query: str) -> ScrapingResult:
-        """Scrape with automatic profile management"""
+        """Scrape with automatic profile management."""
         if not self.browser_manager:
             raise RuntimeError("Scraper not initialized. Use async context manager.")
-        
+
         page = await self.browser_manager.get_page()
         return await self.scraper.scrape(page, query, self.browser_manager)
 
@@ -512,20 +523,50 @@ class ChatGPTScraper:
     async def scrape(self, page: Page, query: str, browser_manager: Any = None) -> ScrapingResult:
 
         timestamp = datetime.now().isoformat()
-        
-        try:
-            # Telemetry Block
-            if browser_manager:
-                await page.route("**/*", lambda route: route.abort() if browser_manager._should_block_request(route.request) else route.continue_())
 
+        try:
+            # --- Telemetry Block ---
+            if browser_manager:
+                await page.route(
+                    "**/*",
+                    lambda route: route.abort()
+                    if browser_manager._should_block_request(route.request)
+                    else route.continue_()
+                )
+
+            # ----------------------------------------------------------------
+            # PRE-FLIGHT WARM-UP
+            # Navigate to a high-trust benign site before touching ChatGPT.
+            # This has two benefits:
+            #   1. Establishes a real TLS session ticket with a well-known CA,
+            #      making our TLS fingerprint look like a live browsing session.
+            #   2. Seeds the browser with third-party cookies and a browsing
+            #      history entry — signals that Cloudflare weighs heavily in
+            #      its trust score.
+            # ----------------------------------------------------------------
+            WARMUP_URL = "https://en.wikipedia.org/wiki/Main_Page"
+            try:
+                print(f"🌐 Pre-flight warm-up: navigating to {WARMUP_URL}...")
+                await page.goto(WARMUP_URL, wait_until="domcontentloaded", timeout=20000)
+                await asyncio.sleep(random.uniform(2.0, 3.5))
+                # Brief, human-like interaction on the warm-up page
+                await page.mouse.move(
+                    random.randint(200, 800), random.randint(200, 500), steps=8
+                )
+                await page.mouse.wheel(0, random.randint(150, 400))
+                await asyncio.sleep(random.uniform(0.5, 1.2))
+                print("   ✓ Warm-up complete — TLS ticket established.")
+            except Exception as warmup_err:
+                # Non-fatal: log and continue to ChatGPT anyway
+                print(f"   ⚠️ Warm-up navigation failed (non-fatal): {warmup_err}")
 
             print(f"Navigating to {self.selectors.CHATGPT_URL}...")
             await page.goto(self.selectors.CHATGPT_URL, wait_until="domcontentloaded", timeout=60000)
-            
-            # Settle period: Allow the "Honest Linux" system to be poked by scripts
-            # and respond naturally before we start acting.
+
+            # Settle period: let ChatGPT's fingerprinting scripts run and observe
+            # a naturally-paced session rather than an instant bot sequence.
             print("⏳ Settling session...")
-            await asyncio.sleep(3.0) 
+            await asyncio.sleep(random.uniform(2.5, 4.0))
             
             # --- CLOUDFLARE CHECK ---
             try:
