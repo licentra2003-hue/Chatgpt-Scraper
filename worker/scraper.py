@@ -4,6 +4,7 @@ import random
 import hashlib
 import shutil
 import re
+from contextlib import asynccontextmanager
 from datetime import datetime
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Any
@@ -531,6 +532,162 @@ class ManagedChatGPTScraper:
         return await self.scraper.scrape(page, query, self.browser_manager)
 
 
+
+# ==================== SHARED BROWSER (CONCURRENT CONTEXT MANAGER) ====================
+
+class SharedBrowser:
+    """
+    Manages a single Chromium browser process that dispenses isolated
+    BrowserContext instances (one per concurrent job slot).  Each context
+    has its own cookies, localStorage and network identity so jobs never
+    interfere with each other even though they share the same process.
+
+    Usage:
+        shared = SharedBrowser(worker_id="worker_abc123")
+        await shared.start()
+
+        async with shared.new_context() as (context, browser_manager):
+            page = await context.new_page()
+            # ... scrape ...
+
+        await shared.close()
+    """
+
+    def __init__(self, worker_id: str):
+        self.worker_id = worker_id
+        self.playwright = None
+        self.browser = None
+        # Build a consistent stealth fingerprint seeded from the worker identity
+        self._bm_seed = BrowserManager(user_data_dir=f"/tmp/seed_{worker_id}")
+        self.stealth_config = self._bm_seed.stealth_config
+        self.linux_ua = self._bm_seed.linux_ua
+        self.stealth_js = self._bm_seed.stealth_js
+        self._launch_args = None
+
+    async def start(self):
+        """Launch the shared browser process (called once per worker)."""
+        if self.browser is not None:
+            return
+
+        import os
+        from playwright_stealth import Stealth
+
+        self.playwright = await async_playwright().start()
+
+        headless = os.environ.get("HEADLESS", "true").lower() == "true"
+
+        proxy_server = os.environ.get("PROXY_SERVER")
+        proxy = None
+        if proxy_server:
+            if not proxy_server.startswith(("http://", "https://")):
+                proxy_server = f"http://{proxy_server}"
+            proxy = {
+                "server":   proxy_server,
+                "username": os.environ.get("PROXY_USERNAME"),
+                "password": os.environ.get("PROXY_PASSWORD"),
+            }
+
+        self._launch_args = [
+            '--disable-blink-features=AutomationControlled',
+            '--exclude-switches=enable-automation',
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--use-gl=angle',
+            '--use-angle=swiftshader',
+            '--enable-webgl',
+            '--enable-webgl2',
+            '--enable-accelerated-2d-canvas',
+            '--window-size=1920,1080',
+            '--hide-scrollbars',
+            '--mute-audio',
+            '--force-device-scale-factor=1',
+            '--ignore-certificate-errors',
+            '--disable-notifications',
+            '--disable-infobars',
+            '--disable-extensions',
+            '--disable-background-timer-throttling',
+            '--disable-backgrounding-occluded-windows',
+            '--disable-renderer-backgrounding',
+        ]
+        if headless:
+            self._launch_args.append('--headless=new')
+
+        self._stealth = Stealth(
+            webgl_vendor_override=self.stealth_config['gpu_vendor'],
+            webgl_renderer_override=self.stealth_config['gpu_renderer'],
+            navigator_platform_override='Linux x86_64',
+            navigator_languages_override=('en-US', 'en'),
+            navigator_user_agent_override=self.linux_ua,
+        )
+
+        self._proxy = proxy
+        self.browser = await self.playwright.chromium.launch(
+            headless=False,          # headless=new is passed via args
+            args=self._launch_args,
+            ignore_default_args=['--enable-automation'],
+        )
+        print(f"[{self.worker_id}] Shared browser launched.")
+
+    @asynccontextmanager
+    async def new_context(self):
+        """
+        Async context manager that creates a fresh isolated BrowserContext,
+        applies stealth + init script, then tears it down on exit.
+        Yields (context, stealth_js) — callers open their own pages inside.
+        """
+        if self.browser is None:
+            await self.start()
+
+        ctx = await self.browser.new_context(
+            user_agent=self.linux_ua,
+            viewport={"width": 1920, "height": 1080},
+            locale="en-US",
+            timezone_id="Asia/Kolkata",
+            color_scheme="light",
+            proxy=self._proxy,
+            extra_http_headers={
+                'Accept':                    'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                'Accept-Encoding':           'gzip, deflate, br',
+                'Accept-Language':           'en-US,en;q=0.9',
+                'DNT':                       '1',
+                'Sec-CH-UA':                 '"Google Chrome";v="129", "Not=A?Brand";v="8", "Chromium";v="129"',
+                'Sec-CH-UA-Mobile':          '?0',
+                'Sec-CH-UA-Platform':        '"Linux"',
+            },
+        )
+        await self._stealth.apply_stealth_async(ctx)
+        try:
+            yield ctx, self
+        finally:
+            try:
+                await ctx.close()
+            except Exception:
+                pass
+
+    async def close(self):
+        """Shut down the shared browser (called once on worker exit)."""
+        try:
+            if self.browser:
+                await self.browser.close()
+                self.browser = None
+        except Exception:
+            pass
+        try:
+            if self.playwright:
+                await self.playwright.stop()
+                self.playwright = None
+        except Exception:
+            pass
+
+    # ── Helpers expected by ChatGPTScraper ────────────────────────────────
+    def _should_block_request(self, request):
+        return self._bm_seed._should_block_request(request)
+
+    async def _bezier_move(self, page, start, end):
+        return await self._bm_seed._bezier_move(page, start, end)
+
+
 # ==================== SCRAPER CLASS ====================
 class ChatGPTScraper:
     def __init__(self):
@@ -611,11 +768,11 @@ class ChatGPTScraper:
 
     async def _kill_overlays(self, page: Page):
         # First pass — catch banners that appear on initial load
-        await asyncio.sleep(2)
+        await asyncio.sleep(random.uniform(2, 5))
         await self._dismiss_overlays_pass(page)
         
         # Second pass — catch banners that re-render or appear after first pass
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(random.uniform(2, 5))
         await self._dismiss_overlays_pass(page)
         
         await page.keyboard.press("Escape")

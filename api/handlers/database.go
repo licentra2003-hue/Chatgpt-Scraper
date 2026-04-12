@@ -123,7 +123,7 @@ func (d *Database) restRequest(method string, path string, body any) (*http.Resp
 	return http.DefaultClient.Do(req)
 }
 
-func (d *Database) CreateJob(query string, productID, snapshotID *string) (*models.Job, error) {
+func (d *Database) CreateJob(query string, productID, snapshotID, callbackURL, workerID *string) (*models.Job, error) {
 	// Mock database implementation
 	if d.db == nil {
 		if d.restURL != "" {
@@ -133,6 +133,12 @@ func (d *Database) CreateJob(query string, productID, snapshotID *string) (*mode
 				"job_id":     jobID.String(),
 				"engine":     "Chatgpt",
 				"expires_at": expiresAt,
+			}
+			if callbackURL != nil {
+				payload["callback_url"] = *callbackURL
+			}
+			if workerID != nil {
+				payload["worker_id"] = *workerID
 			}
 
 			resp, err := d.restRequest("POST", "/processed_jobs", payload)
@@ -146,25 +152,29 @@ func (d *Database) CreateJob(query string, productID, snapshotID *string) (*mode
 			}
 
 			return &models.Job{
-				ID:         jobID,
-				Query:      query,
-				Status:     "pending",
-				CreatedAt:  time.Now(),
-				UpdatedAt:  time.Now(),
-				ProductID:  productID,
-				SnapshotID: snapshotID,
+				ID:          jobID,
+				Query:       query,
+				Status:      "pending",
+				CreatedAt:   time.Now(),
+				UpdatedAt:   time.Now(),
+				ProductID:   productID,
+				SnapshotID:  snapshotID,
+				CallbackURL: callbackURL,
+				WorkerID:    workerID,
 			}, nil
 		}
 
 		log.Printf("MOCK: Creating job with query: %s", query)
 		job := &models.Job{
-			ID:         uuid.New(),
-			Query:      query,
-			Status:     "pending",
-			CreatedAt:  time.Now(),
-			UpdatedAt:  time.Now(),
-			ProductID:  productID,
-			SnapshotID: snapshotID,
+			ID:          uuid.New(),
+			Query:       query,
+			Status:      "pending",
+			CreatedAt:   time.Now(),
+			UpdatedAt:   time.Now(),
+			ProductID:   productID,
+			SnapshotID:  snapshotID,
+			CallbackURL: callbackURL,
+			WorkerID:    workerID,
 		}
 		log.Printf("MOCK: Created job %s", job.ID)
 		return job, nil
@@ -174,23 +184,25 @@ func (d *Database) CreateJob(query string, productID, snapshotID *string) (*mode
 	expiresAt := time.Now().Add(24 * time.Hour)
 
 	// Store into processed_jobs tracking table. Note: schema uses job_id (varchar) not uuid id.
-	querySQL := `INSERT INTO processed_jobs (job_id, engine, expires_at)
-				 VALUES ($1, $2, $3)`
+	querySQL := `INSERT INTO processed_jobs (job_id, engine, expires_at, callback_url, worker_id)
+				 VALUES ($1, $2, $3, $4, $5)`
 
-	_, err := d.db.Exec(querySQL, jobID.String(), "Chatgpt", expiresAt)
+	_, err := d.db.Exec(querySQL, jobID.String(), "Chatgpt", expiresAt, callbackURL, workerID)
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to create job: %w", err)
 	}
 
 	return &models.Job{
-		ID:         jobID,
-		Query:      query,
-		Status:     "pending",
-		CreatedAt:  time.Now(),
-		UpdatedAt:  time.Now(),
-		ProductID:  productID,
-		SnapshotID: snapshotID,
+		ID:          jobID,
+		Query:       query,
+		Status:      "pending",
+		CreatedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
+		ProductID:   productID,
+		SnapshotID:  snapshotID,
+		CallbackURL: callbackURL,
+		WorkerID:    workerID,
 	}, nil
 }
 

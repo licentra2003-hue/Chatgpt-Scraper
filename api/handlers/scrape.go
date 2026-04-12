@@ -146,7 +146,7 @@ func (h *ScrapeHandler) PostScrape(c *fiber.Ctx) error {
 	}
 
 	// Create job in database
-	job, err := h.db.CreateJob(req.Query, req.ProductID, req.SnapshotID)
+	job, err := h.db.CreateJob(req.Query, req.ProductID, req.SnapshotID, req.CallbackURL, req.WorkerID)
 	if err != nil {
 		log.Printf("Failed to create job: %v", err)
 		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{

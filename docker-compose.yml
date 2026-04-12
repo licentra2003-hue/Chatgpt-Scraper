@@ -45,12 +45,13 @@ services:
       PROXY_USERNAME: "godseye_hY287"
       PROXY_PASSWORD: "Godseye+584101"
       API_URL: http://api:3000
+      JOBS_PER_WORKER: "1"
     depends_on:
       - rabbitmq
       - api
     restart: unless-stopped
     deploy:
-      replicas: 1 # Reduce to 1 for testing
+      replicas: 5
     ipc: host # Allow browser shared memory
     volumes:
       - worker_profiles:/app/profiles

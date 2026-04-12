@@ -62,10 +62,12 @@ func NewQueue() (*Queue, error) {
 
 func (q *Queue) PublishJob(job *models.Job) error {
 	message := models.QueueMessage{
-		JobID:      job.ID,
-		Query:      job.Query,
-		ProductID:  job.ProductID,
-		SnapshotID: job.SnapshotID,
+		JobID:       job.ID,
+		Query:       job.Query,
+		ProductID:   job.ProductID,
+		SnapshotID:  job.SnapshotID,
+		CallbackURL: job.CallbackURL,
+		WorkerID:    job.WorkerID,
 	}
 
 	body, err := json.Marshal(message)
