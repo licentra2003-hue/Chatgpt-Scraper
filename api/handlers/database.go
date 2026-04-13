@@ -129,6 +129,15 @@ func (d *Database) CreateJob(query string, productID, snapshotID, callbackURL, w
 		if d.restURL != "" {
 			jobID := uuid.New()
 			expiresAt := time.Now().Add(24 * time.Hour).Format(time.RFC3339Nano)
+
+			// Fallback to global CALLBACK_URL from .env if not provided in request
+			if callbackURL == nil || *callbackURL == "" {
+				defaultCB := getEnv("CALLBACK_URL", "")
+				if defaultCB != "" {
+					callbackURL = &defaultCB
+				}
+			}
+
 			payload := map[string]any{
 				"job_id":     jobID.String(),
 				"engine":     "Chatgpt",
@@ -182,6 +191,14 @@ func (d *Database) CreateJob(query string, productID, snapshotID, callbackURL, w
 
 	jobID := uuid.New()
 	expiresAt := time.Now().Add(24 * time.Hour)
+
+	// Fallback to global CALLBACK_URL from .env if not provided in request
+	if callbackURL == nil || *callbackURL == "" {
+		defaultCB := getEnv("CALLBACK_URL", "")
+		if defaultCB != "" {
+			callbackURL = &defaultCB
+		}
+	}
 
 	// Store into processed_jobs tracking table. Note: schema uses job_id (varchar) not uuid id.
 	querySQL := `INSERT INTO processed_jobs (job_id, engine, expires_at, callback_url, worker_id)
